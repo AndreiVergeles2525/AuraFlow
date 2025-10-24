@@ -79,8 +79,32 @@ build_swift_app() {
   log "Building Swift target"
   pushd "$SWIFT_DIR" >/dev/null
   swift build -c release
+
+  local arm_binary="$SWIFT_DIR/.build/arm64-apple-macosx/release/${APP_TARGET}"
+  local x86_binary="$SWIFT_DIR/.build/x86_64-apple-macosx/release/${APP_TARGET}"
+  local universal_dir="$SWIFT_DIR/.build/universal"
+
+  if command -v arch >/dev/null 2>&1; then
+    if arch -x86_64 swift build -c release >/dev/null 2>&1; then
+      log "Built x86_64 slice"
+    else
+      log "[warn] Failed to build x86_64 slice (Rosetta required). Using arm64 only."
+    fi
+  else
+    log "[warn] 'arch' command not found; building arm64 slice only."
+  fi
+
   local bin_path
-  bin_path=$(swift build -c release --show-bin-path)
+  if [[ -f "$arm_binary" && -f "$x86_binary" ]]; then
+    mkdir -p "$universal_dir"
+    lipo -create -output "$universal_dir/${APP_TARGET}" "$arm_binary" "$x86_binary"
+    bin_path="$universal_dir"
+    log "Created universal binary"
+  elif [[ -f "$arm_binary" ]]; then
+    bin_path="$(dirname "$arm_binary")"
+  else
+    bin_path=$(swift build -c release --show-bin-path)
+  fi
   popd >/dev/null
 
   local binary="$bin_path/${APP_TARGET}"
