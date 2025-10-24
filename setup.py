@@ -6,9 +6,9 @@ DATA_FILES = []
 OPTIONS = {
     "argv_emulation": False,
     "plist": {
-        "CFBundleIdentifier": "com.example.videowallpaper",
-        "CFBundleName": "VideoWallpaper",
-        "CFBundleDisplayName": "Video Wallpaper",
+        "CFBundleIdentifier": "com.example.auraflow",
+        "CFBundleName": "AuraFlow",
+        "CFBundleDisplayName": "AuraFlow",
         "LSUIElement": True,
         "NSHighResolutionCapable": True,
     },

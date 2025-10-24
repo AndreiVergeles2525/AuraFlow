@@ -1,1 +1,1 @@
-# Python package marker for Video Wallpaper daemon and utilities.
+# Python package marker for AuraFlow daemon and utilities.

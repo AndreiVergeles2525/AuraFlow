@@ -1,4 +1,4 @@
-# Video Wallpaper Suite for macOS
+# AuraFlow for macOS
 
 Комплексный проект живых обоев под macOS с демоном на Python и нативным интерфейсом на AppKit + SwiftUI. Swift-приложение управляет демоном через Objective-C bridge, вызывающий Python-скрипты. Поддерживается предпросмотр, выбор видео, изменение скорости воспроизведения, автозапуск и установка первого кадра в качестве системных обоев.
 
@@ -27,13 +27,21 @@ pip install -r python/requirements.txt
 python3 python/control.py start --video /path/to/video.mp4 --speed 1.0
 ```
 
-## Сборка `.app`
-1. Поместите иконку приложения (`Resources/AppIcon.png`, 768×768) или заранее подготовленный `Resources/AppIcon.icns`.
-2. Запустите:
-   ```bash
-   ./build_app.sh
-   ```
-3. Результат появится в `dist/VideoWallpaper.app`, а также `dist/VideoWallpaper.zip` для передачи пользователям.
+## Готовый DMG
+Скрипт сборки формирует готовый установщик:
+
+```bash
+./build_app.sh
+```
+
+В каталоге `dist/` окажутся:
+- `AuraFlow.app` — собранное приложение;
+- `AuraFlow.zip` — архив, если нужно отправить пакет по почте;
+- `AuraFlow.dmg` — образ диска для конечных пользователей.
+
+Чтобы установить приложение из `.dmg`, пользователю достаточно открыть образ, перетащить `AuraFlow.app` в папку `Applications` и запустить его (при первом старте macOS может запросить подтверждение для приложения от неизвестного разработчика).
+
+> Примечание: перед сборкой положите иконку `Resources/AppIcon.png` (768×768) или заранее подготовленный `Resources/AppIcon.icns` — скрипт автоматом сгенерирует `.icns`, если есть PNG.
 
 ## Запуск SwiftUI-клиента из исходников
 ```bash
@@ -66,17 +74,9 @@ swift test
 ```bash
 python3 python/control.py set-autostart on
 ```
-Будет создан LaunchAgent `~/Library/LaunchAgents/com.example.videowallpaper.plist`.
-
-## Работа с Git
-```bash
-git init
-git add .
-git commit -m "Initial enterprise build"
-```
-После инициализации подключите удалённый репозиторий и настройте CI/CD при необходимости.
+Будет создан LaunchAgent `~/Library/LaunchAgents/com.example.auraflow.plist`.
 
 ## Диагностика
-- Логи демона: `~/Library/Application Support/VideoWallpaper/daemon.log`.
-- PID-файл: `~/Library/Application Support/VideoWallpaper/daemon.pid`.
-- Конфигурация: `~/Library/Application Support/VideoWallpaper/config.json`.
+- Логи демона: `~/Library/Application Support/AuraFlow/daemon.log`.
+- PID-файл: `~/Library/Application Support/AuraFlow/daemon.pid`.
+- Конфигурация: `~/Library/Application Support/AuraFlow/config.json`.

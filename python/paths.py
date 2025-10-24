@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 APP_ID = "com.example.videowallpaper"
-APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "VideoWallpaper"
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AuraFlow"
 CONFIG_PATH = APP_SUPPORT_DIR / "config.json"
 PID_PATH = APP_SUPPORT_DIR / "daemon.pid"
 LOG_PATH = APP_SUPPORT_DIR / "daemon.log"

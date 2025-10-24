@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Video Wallpaper Player for macOS
---------------------------------
+AuraFlow Player for macOS
+-------------------------
 
 Launches a borderless, click-through window at desktop level that loops a given
 video across all active displays. Requires macOS with PyObjC bindings installed.
@@ -22,11 +22,11 @@ import AVKit
 import Quartz
 
 
-class VideoWallpaperController(NSObject):
+class AuraFlowController(NSObject):
     """Configures desktop-level windows that play a looping video."""
 
     def initWithURL_volume_(self, url, volume):
-        self = objc.super(VideoWallpaperController, self).init()
+        self = objc.super(AuraFlowController, self).init()
         if self is None:
             return None
 
@@ -115,7 +115,7 @@ class WallpaperAppDelegate(NSObject):
         return self
 
     def applicationDidFinishLaunching_(self, _notification):
-        self.controller = VideoWallpaperController.alloc().initWithURL_volume_(
+        self.controller = AuraFlowController.alloc().initWithURL_volume_(
             self._url, self._volume
         )
 

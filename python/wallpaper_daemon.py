@@ -59,11 +59,11 @@ def load_config(path: Path) -> DaemonConfig:
     )
 
 
-class VideoWallpaperController(NSObject):
+class AuraFlowController(NSObject):
     """Configures desktop-level windows that play a looping video."""
 
     def initWithConfig_(self, config: DaemonConfig):
-        self = objc.super(VideoWallpaperController, self).init()
+        self = objc.super(AuraFlowController, self).init()
         if self is None:
             return None
 
@@ -179,7 +179,7 @@ class WallpaperAppDelegate(NSObject):
         return self
 
     def applicationDidFinishLaunching_(self, _notification):
-        self.controller = VideoWallpaperController.alloc().initWithConfig_(self._config)
+        self.controller = AuraFlowController.alloc().initWithConfig_(self._config)
         write_pid_file()
 
     def applicationShouldTerminate_(self, _sender):

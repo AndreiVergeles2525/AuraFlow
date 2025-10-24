@@ -7,8 +7,10 @@ SWIFT_DIR="$ROOT_DIR/macOSApp"
 PYTHON_DIR="$ROOT_DIR/python"
 DIST_DIR="$ROOT_DIR/dist"
 APP_TARGET="WallpaperControlApp"
-APP_DISPLAY_NAME="VideoWallpaper"
+APP_DISPLAY_NAME="AuraFlow"
 APP_BUNDLE="$DIST_DIR/${APP_DISPLAY_NAME}.app"
+APP_ZIP="$DIST_DIR/${APP_DISPLAY_NAME}.zip"
+APP_DMG="$DIST_DIR/${APP_DISPLAY_NAME}.dmg"
 ICON_PNG="$ROOT_DIR/Resources/AppIcon.png"
 ICON_ICNS="$ROOT_DIR/Resources/AppIcon.icns"
 PYTHON_BIN="${PYTHON_BUILD_PYTHON:-/usr/bin/python3}"
@@ -110,11 +112,11 @@ build_swift_app() {
   <key>CFBundleExecutable</key>
   <string>WallpaperControlApp</string>
   <key>CFBundleIdentifier</key>
-  <string>com.example.videowallpaper</string>
+  <string>com.example.auraflow</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>VideoWallpaper</string>
+  <string>AuraFlow</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -152,7 +154,7 @@ apply_plist_customizations() {
   local plist="$APP_BUNDLE/Contents/Info.plist"
   plist_set_string "$plist" CFBundleName "$APP_DISPLAY_NAME"
   plist_set_string "$plist" CFBundleDisplayName "$APP_DISPLAY_NAME"
-  plist_set_string "$plist" CFBundleIdentifier "com.example.videowallpaper"
+  plist_set_string "$plist" CFBundleIdentifier "com.example.auraflow"
   plist_set_bool "$plist" LSUIElement true
 
   /usr/libexec/PlistBuddy -c "Delete :LSEnvironment" "$plist" 2>/dev/null || true
@@ -165,10 +167,24 @@ apply_plist_customizations() {
 }
 
 package_distribution() {
-  log "Создание архива"
+  log "Создание ZIP архива"
   pushd "$DIST_DIR" >/dev/null
-  ditto -c -k --keepParent "${APP_DISPLAY_NAME}.app" "${APP_DISPLAY_NAME}.zip"
+  ditto -c -k --keepParent "${APP_DISPLAY_NAME}.app" "$(basename "$APP_ZIP")"
   popd >/dev/null
+
+  log "Создание DMG"
+  local dmg_stage="$DIST_DIR/.dmg-stage"
+  rm -rf "$dmg_stage"
+  mkdir -p "$dmg_stage"
+  cp -R "$APP_BUNDLE" "$dmg_stage/${APP_DISPLAY_NAME}.app"
+  ln -s /Applications "$dmg_stage/Applications"
+
+  hdiutil create -volname "$APP_DISPLAY_NAME" \
+    -srcfolder "$dmg_stage" \
+    -ov -format UDZO "$APP_DMG" >/dev/null
+
+  rm -rf "$dmg_stage"
+  log "DMG готов: $APP_DMG"
 }
 
 main() {
@@ -178,6 +194,7 @@ main() {
   apply_plist_customizations
   package_distribution
   log "Готово: $APP_BUNDLE"
+  log "Архивы: $APP_ZIP и $APP_DMG"
 }
 
 main "$@"
