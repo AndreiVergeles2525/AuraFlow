@@ -10,7 +10,6 @@ __pycache__/
 .venv/
 
 # Distribution artifacts
-dist/
 build/
 .build-venv/
 
