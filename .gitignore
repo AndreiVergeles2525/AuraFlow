@@ -1,0 +1,23 @@
+# macOS / Xcode
+.DS_Store
+.swiftpm/
+.build/
+DerivedData/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Distribution artifacts
+dist/
+build/
+.build-venv/
+
+# Logs / temp
+*.log
+*.tmp
+
+# IDE
+.idea/
+.vscode/
