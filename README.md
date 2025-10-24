@@ -1,7 +1,7 @@
 # AuraFlow for macOS
 
 <p align="center">
-  <img src="docs/aura-ui.png" width="720" alt="AuraFlow UI preview" />
+  <img src="docs/bocchi.png" width="720" alt="AuraFlow UI preview" />
 </p>
 
 AuraFlow — живые обои для macOS: демон на Python и GUI на AppKit + SwiftUI. Интерфейс скрывается при бездействии, позволяет выбрать видео, задать скорость воспроизведения, мгновенно обновить системные обои и управлять автозапуском демона.
