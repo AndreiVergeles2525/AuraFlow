@@ -50,7 +50,23 @@ final class MockPythonController: PythonControlling {
         try status()
     }
 
+    func setInterpolation(_ enabled: Bool) throws -> ControlStatus {
+        try status()
+    }
+
+    func setPauseOnFullscreen(_ enabled: Bool) throws -> ControlStatus {
+        try status()
+    }
+
+    func setScaleMode(_ mode: WallpaperScaleMode) throws -> ControlStatus {
+        try status()
+    }
+
     func setAutostart(_ enabled: Bool) throws -> ControlStatus {
         try status()
+    }
+
+    func metrics() throws -> DaemonMetrics {
+        DaemonMetrics(running: false)
     }
 }

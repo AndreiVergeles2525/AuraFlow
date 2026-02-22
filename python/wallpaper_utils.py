@@ -5,9 +5,16 @@ Utility helpers for working with video frames and macOS desktop wallpaper.
 from __future__ import annotations
 
 import json
+import subprocess
+import time
 from pathlib import Path
 
-from paths import LAST_FRAME_PATH, WALLPAPER_BACKUP_PATH, ensure_app_support_dir
+from paths import (
+    LAST_FRAME_PATH,
+    WALLPAPER_BACKUP_PATH,
+    WALLPAPER_ORIGINAL_BACKUP_PATH,
+    ensure_app_support_dir,
+)
 
 try:  # pragma: no cover - import availability depends on host environment
     import AppKit
@@ -53,21 +60,37 @@ def _current_wallpapers() -> dict[str, str]:
     return wallpapers
 
 
-def _load_wallpaper_backup() -> dict[str, str]:
-    if not WALLPAPER_BACKUP_PATH.exists():
-        return {}
-    try:
-        data = json.loads(WALLPAPER_BACKUP_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+def _sanitize_wallpaper_backup(data: object) -> dict[str, str]:
     if not isinstance(data, dict):
         return {}
 
     wallpapers: dict[str, str] = {}
     for key, value in data.items():
-        if isinstance(key, str) and isinstance(value, str) and value:
-            wallpapers[key] = value
+        if not isinstance(key, str) or not isinstance(value, str) or not value:
+            continue
+        if _is_managed_wallpaper(value):
+            continue
+        wallpapers[key] = value
     return wallpapers
+
+
+def _load_wallpaper_backup(path: Path | None = None) -> dict[str, str]:
+    if path is None:
+        path = WALLPAPER_BACKUP_PATH
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return _sanitize_wallpaper_backup(data)
+
+
+def _write_wallpaper_backup(path: Path, wallpapers: dict[str, str]) -> None:
+    path.write_text(
+        json.dumps(wallpapers, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _is_managed_wallpaper(path: str) -> bool:
@@ -84,24 +107,20 @@ def _is_managed_wallpaper(path: str) -> bool:
 
 def _save_wallpaper_backup_if_needed() -> None:
     ensure_app_support_dir()
-
-    if WALLPAPER_BACKUP_PATH.exists():
-        if _load_wallpaper_backup():
-            return
-        WALLPAPER_BACKUP_PATH.unlink(missing_ok=True)
-
-    wallpapers = {
-        screen_id: path
-        for screen_id, path in _current_wallpapers().items()
-        if not _is_managed_wallpaper(path)
-    }
+    wallpapers = _sanitize_wallpaper_backup(_current_wallpapers())
     if not wallpapers:
         return
 
-    WALLPAPER_BACKUP_PATH.write_text(
-        json.dumps(wallpapers, indent=2),
-        encoding="utf-8",
-    )
+    existing = _load_wallpaper_backup(WALLPAPER_BACKUP_PATH)
+    if existing == wallpapers:
+        original_existing = _load_wallpaper_backup(WALLPAPER_ORIGINAL_BACKUP_PATH)
+        if not original_existing:
+            _write_wallpaper_backup(WALLPAPER_ORIGINAL_BACKUP_PATH, wallpapers)
+        return
+
+    _write_wallpaper_backup(WALLPAPER_BACKUP_PATH, wallpapers)
+    if not _load_wallpaper_backup(WALLPAPER_ORIGINAL_BACKUP_PATH):
+        _write_wallpaper_backup(WALLPAPER_ORIGINAL_BACKUP_PATH, wallpapers)
 
 
 def _restore_wallpaper_paths(wallpapers: dict[str, str]) -> bool:
@@ -110,6 +129,7 @@ def _restore_wallpaper_paths(wallpapers: dict[str, str]) -> bool:
     workspace = AppKit.NSWorkspace.sharedWorkspace()
     fallback = next(iter(wallpapers.values()), None)
     restored = False
+    applied_fallback_path: str | None = None
 
     for screen in AppKit.NSScreen.screens():
         path = wallpapers.get(_screen_identifier(screen)) or fallback
@@ -119,10 +139,103 @@ def _restore_wallpaper_paths(wallpapers: dict[str, str]) -> bool:
         if not image_path.exists():
             continue
         url = NSURL.fileURLWithPath_(str(image_path))
-        workspace.setDesktopImageURL_forScreen_options_error_(url, screen, {}, None)
-        restored = True
+        result = workspace.setDesktopImageURL_forScreen_options_error_(url, screen, {}, None)
+        success = False
+        if isinstance(result, tuple):
+            success = bool(result[0])
+        elif isinstance(result, bool):
+            success = result
+        else:
+            success = True
+
+        if success:
+            restored = True
+            if applied_fallback_path is None:
+                applied_fallback_path = str(image_path)
+
+    if restored and applied_fallback_path:
+        if not _set_all_desktops_picture_via_system_events(applied_fallback_path):
+            return False
+        return not _any_screen_uses_managed_wallpaper()
 
     return restored
+
+
+def _any_screen_uses_managed_wallpaper() -> bool:
+    for path in _current_wallpapers().values():
+        if _is_managed_wallpaper(path):
+            return True
+    return False
+
+
+def _set_all_desktops_picture_via_system_events(path: str) -> bool:
+    """
+    Fallback for Spaces-specific wallpaper assignments when NSWorkspace APIs
+    report success but the active desktop still remains on AuraFlow frame.
+    """
+
+    escaped_path = path.replace("\\", "\\\\").replace('"', '\\"')
+    scripts = [
+        (
+            'tell application "System Events"\n'
+            f'  repeat with d in desktops\n'
+            f'    set picture of d to POSIX file "{escaped_path}"\n'
+            "  end repeat\n"
+            "end tell"
+        ),
+        (
+            'tell application "System Events" '
+            f'to set picture of every desktop to POSIX file "{escaped_path}"'
+        ),
+        (
+            'tell application "Finder" '
+            f'to set desktop picture to POSIX file "{escaped_path}"'
+        ),
+    ]
+
+    verification_script = (
+        'tell application "System Events"\n'
+        f'  set targetPath to POSIX path of (POSIX file "{escaped_path}")\n'
+        "  repeat with d in desktops\n"
+        "    try\n"
+        "      set currentPath to POSIX path of (picture of d)\n"
+        "      if currentPath is not targetPath then\n"
+        '        return "mismatch"\n'
+        "      end if\n"
+        "    on error\n"
+        '      return "mismatch"\n'
+        "    end try\n"
+        "  end repeat\n"
+        '  return "ok"\n'
+        "end tell"
+    )
+
+    for _ in range(3):
+        for script in scripts:
+            result = _run_osascript(script)
+            if result is None:
+                return False
+            if result.returncode != 0:
+                continue
+            verification = _run_osascript(verification_script)
+            if verification is None:
+                return False
+            if verification.returncode == 0 and verification.stdout.strip() == "ok":
+                return True
+        time.sleep(0.15)
+    return False
+
+
+def _run_osascript(script: str):
+    try:
+        return subprocess.run(  # noqa: S603
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
 
 
 def _fallback_system_wallpaper() -> dict[str, str]:
@@ -150,8 +263,13 @@ def restore_wallpaper_backup(delete_backup: bool = False) -> bool:
     """
 
     _require_macos_frameworks()
-    wallpapers = _load_wallpaper_backup()
+    wallpapers = _load_wallpaper_backup(WALLPAPER_BACKUP_PATH)
     restored = _restore_wallpaper_paths(wallpapers) if wallpapers else False
+
+    if not restored:
+        original_wallpapers = _load_wallpaper_backup(WALLPAPER_ORIGINAL_BACKUP_PATH)
+        if original_wallpapers:
+            restored = _restore_wallpaper_paths(original_wallpapers)
 
     if not restored:
         fallback_wallpapers = _fallback_system_wallpaper()
@@ -160,6 +278,7 @@ def restore_wallpaper_backup(delete_backup: bool = False) -> bool:
 
     if restored and delete_backup:
         WALLPAPER_BACKUP_PATH.unlink(missing_ok=True)
+        WALLPAPER_ORIGINAL_BACKUP_PATH.unlink(missing_ok=True)
     return restored
 
 
@@ -242,6 +361,7 @@ def set_wallpaper(image_path: Path) -> None:
     url = NSURL.fileURLWithPath_(str(image_path))
     for screen in AppKit.NSScreen.screens():
         workspace.setDesktopImageURL_forScreen_options_error_(url, screen, {}, None)
+    _set_all_desktops_picture_via_system_events(str(image_path.expanduser().resolve(strict=False)))
 
 
 def set_wallpaper_from_video(video_path: Path) -> Path:

@@ -19,6 +19,7 @@ from paths import (
     APP_ID,
     CONFIG_PATH,
     DAEMON_COMMAND_PATH,
+    DAEMON_HEALTH_PATH,
     DAEMON_PAUSED_PATH,
     LOG_PATH,
     PID_PATH,
@@ -27,6 +28,8 @@ from paths import (
 
 
 _LAST_LAUNCH_SIGNATURE: Optional[tuple] = None
+HEALTH_STALE_SECONDS = 4.0
+SCALE_MODES = {"fill", "fit", "stretch"}
 
 
 def _python_executable() -> str:
@@ -82,6 +85,9 @@ def _launch_signature(
     video_path: Optional[str],
     playback_speed: Optional[float],
     volume: Optional[float],
+    blend_interpolation: Optional[bool],
+    pause_on_fullscreen: Optional[bool],
+    scale_mode: Optional[str],
 ) -> tuple:
     try:
         config_hash = hash(config_path.read_bytes())
@@ -92,6 +98,9 @@ def _launch_signature(
         video_path,
         None if playback_speed is None else float(playback_speed),
         None if volume is None else float(volume),
+        None if blend_interpolation is None else bool(blend_interpolation),
+        None if pause_on_fullscreen is None else bool(pause_on_fullscreen),
+        scale_mode or None,
         config_hash,
     )
 
@@ -163,22 +172,39 @@ def _cleanup_orphaned_daemons(keep: Optional[set[int]] = None) -> None:
         _terminate_pid(pid, timeout=0.5)
 
 
+def _resolve_primary_daemon_pid() -> Optional[int]:
+    """
+    Return the daemon PID to use for status/metrics.
+
+    If PID file is stale but a daemon process exists, auto-heal PID_PATH.
+    """
+
+    pid_from_file = read_pid()
+    active = _list_daemon_pids()
+
+    if pid_from_file is not None and pid_from_file in active:
+        return pid_from_file
+
+    if not active:
+        if pid_from_file is not None:
+            try:
+                PID_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return None
+
+    resolved = max(active)
+    try:
+        _write_pid(resolved)
+    except OSError:
+        pass
+    return resolved
+
+
 def daemon_running() -> bool:
     """Check the PID file and verify whether the daemon is alive."""
 
-    pid = read_pid()
-    if pid is None:
-        return False
-
-    active = _list_daemon_pids()
-    if pid in active:
-        return True
-
-    try:
-        PID_PATH.unlink(missing_ok=True)
-    except OSError:
-        pass
-    return False
+    return _resolve_primary_daemon_pid() is not None
 
 
 def daemon_paused() -> bool:
@@ -186,13 +212,161 @@ def daemon_paused() -> bool:
 
     if not DAEMON_PAUSED_PATH.exists():
         return False
-    if not daemon_running():
+    if _resolve_primary_daemon_pid() is None:
         try:
             DAEMON_PAUSED_PATH.unlink(missing_ok=True)
         except OSError:
             pass
         return False
     return True
+
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _config_scale_mode(default: str = "fill") -> str:
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+    if not isinstance(raw, dict):
+        return default
+    mode = str(raw.get("scale_mode") or "").strip().lower()
+    if mode in SCALE_MODES:
+        return mode
+    return default
+
+
+def daemon_health(alive: Optional[bool] = None, paused: Optional[bool] = None) -> dict:
+    """
+    Return a normalized daemon health snapshot consumed by CLI and Swift UI.
+    """
+
+    if alive is None:
+        alive = daemon_running()
+    if paused is None:
+        paused = daemon_paused() if alive else False
+
+    health = {
+        "contract_version": 2,
+        "available": False,
+        "fresh": False,
+        "suspicious": False,
+        "reason": "",
+        "updated_at": None,
+        "lag_seconds": None,
+        "screens": 0,
+        "windows": 0,
+        "player_rate": 0.0,
+        "stall_events": 0,
+        "recovery_events": 0,
+        "consecutive_stall_polls": 0,
+        "paused": bool(paused),
+        "manual_paused": False,
+        "low_power_mode": False,
+        "auto_paused_for_low_power": False,
+        "blend_interpolation_enabled": False,
+        "blend_interpolation_active": False,
+        "pause_on_fullscreen": True,
+        "scale_mode": _config_scale_mode("fill"),
+        "fullscreen_app_detected": False,
+        "auto_paused_for_fullscreen": False,
+    }
+
+    if not alive:
+        return health
+
+    if not DAEMON_HEALTH_PATH.exists():
+        health["suspicious"] = True
+        health["reason"] = "missing_heartbeat"
+        return health
+
+    try:
+        raw = json.loads(DAEMON_HEALTH_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        health["suspicious"] = True
+        health["reason"] = "invalid_heartbeat"
+        return health
+
+    if not isinstance(raw, dict):
+        health["suspicious"] = True
+        health["reason"] = "invalid_heartbeat"
+        return health
+
+    updated_at = _coerce_float(raw.get("updated_at"), 0.0)
+    lag = max(0.0, time.time() - updated_at) if updated_at > 0 else None
+    fresh = bool(lag is not None and lag <= HEALTH_STALE_SECONDS)
+
+    reason = str(raw.get("reason") or "")
+    suspicious = _coerce_bool(raw.get("suspicious"), False) or not fresh
+    if not fresh:
+        reason = f"{reason},stale_heartbeat" if reason else "stale_heartbeat"
+
+    health.update(
+        {
+            "available": True,
+            "fresh": fresh,
+            "suspicious": suspicious,
+            "reason": reason,
+            "updated_at": updated_at if updated_at > 0 else None,
+            "lag_seconds": lag,
+            "screens": _coerce_int(raw.get("screens")),
+            "windows": _coerce_int(raw.get("windows")),
+            "player_rate": _coerce_float(raw.get("player_rate")),
+            "stall_events": _coerce_int(raw.get("stall_events")),
+            "recovery_events": _coerce_int(raw.get("recovery_events")),
+            "consecutive_stall_polls": _coerce_int(
+                raw.get("consecutive_stall_polls")
+            ),
+            "paused": _coerce_bool(raw.get("paused"), bool(paused)),
+            "manual_paused": _coerce_bool(raw.get("manual_paused"), False),
+            "low_power_mode": _coerce_bool(raw.get("low_power_mode"), False),
+            "auto_paused_for_low_power": _coerce_bool(
+                raw.get("auto_paused_for_low_power"), False
+            ),
+            "blend_interpolation_enabled": _coerce_bool(
+                raw.get("blend_interpolation_enabled"), False
+            ),
+            "blend_interpolation_active": _coerce_bool(
+                raw.get("blend_interpolation_active"), False
+            ),
+            "pause_on_fullscreen": _coerce_bool(
+                raw.get("pause_on_fullscreen"), True
+            ),
+            "scale_mode": str(raw.get("scale_mode") or "fill"),
+            "fullscreen_app_detected": _coerce_bool(
+                raw.get("fullscreen_app_detected"), False
+            ),
+            "auto_paused_for_fullscreen": _coerce_bool(
+                raw.get("auto_paused_for_fullscreen"), False
+            ),
+            "contract_version": _coerce_int(raw.get("contract_version"), 2),
+        }
+    )
+    return health
 
 
 def read_pid() -> Optional[int]:
@@ -248,6 +422,9 @@ def _launch_daemon(
     video_path: Optional[str] = None,
     playback_speed: Optional[float] = None,
     volume: Optional[float] = None,
+    blend_interpolation: Optional[bool] = None,
+    pause_on_fullscreen: Optional[bool] = None,
+    scale_mode: Optional[str] = None,
 ) -> int:
     ensure_app_support_dir()
     log_file = LOG_PATH.open("ab")
@@ -263,6 +440,16 @@ def _launch_daemon(
         cmd.extend(["--speed", str(playback_speed)])
     if volume is not None:
         cmd.extend(["--volume", str(volume)])
+    if blend_interpolation is not None:
+        cmd.extend(
+            ["--blend-interpolation", "on" if blend_interpolation else "off"]
+        )
+    if pause_on_fullscreen is not None:
+        cmd.extend(
+            ["--pause-on-fullscreen", "on" if pause_on_fullscreen else "off"]
+        )
+    if scale_mode:
+        cmd.extend(["--scale-mode", scale_mode])
     cmd.append("run")
 
     process = subprocess.Popen(  # noqa: S603
@@ -282,6 +469,9 @@ def start_daemon(
     video_path: Optional[str] = None,
     playback_speed: Optional[float] = None,
     volume: Optional[float] = None,
+    blend_interpolation: Optional[bool] = None,
+    pause_on_fullscreen: Optional[bool] = None,
+    scale_mode: Optional[str] = None,
     wait: float = 0.5,
 ) -> int:
     _cleanup_orphaned_daemons()
@@ -292,12 +482,49 @@ def start_daemon(
             # The process may have terminated between checks.
             PID_PATH.unlink(missing_ok=True)
         else:
-            if daemon_paused() and video_path is None and playback_speed is None and volume is None:
+            paused = daemon_paused()
+            if (
+                paused
+                and video_path is None
+                and playback_speed is None
+                and volume is None
+                and blend_interpolation is None
+                and pause_on_fullscreen is None
+                and scale_mode is None
+            ):
                 if resume_daemon():
                     return existing
 
+            if (
+                video_path is None
+                and playback_speed is None
+                and volume is None
+                and blend_interpolation is None
+                and pause_on_fullscreen is None
+                and scale_mode is None
+            ):
+                health = daemon_health(alive=True, paused=paused)
+                if health.get("suspicious"):
+                    return restart_daemon(
+                        config_path=config_path,
+                        video_path=video_path,
+                        playback_speed=playback_speed,
+                        volume=volume,
+                        blend_interpolation=blend_interpolation,
+                        pause_on_fullscreen=pause_on_fullscreen,
+                        scale_mode=scale_mode,
+                        wait=wait,
+                    )
+
             # Plain "start" while already running should be a no-op.
-            if video_path is None and playback_speed is None and volume is None:
+            if (
+                video_path is None
+                and playback_speed is None
+                and volume is None
+                and blend_interpolation is None
+                and pause_on_fullscreen is None
+                and scale_mode is None
+            ):
                 return existing
 
             return restart_daemon(
@@ -305,10 +532,21 @@ def start_daemon(
                 video_path=video_path,
                 playback_speed=playback_speed,
                 volume=volume,
+                blend_interpolation=blend_interpolation,
+                pause_on_fullscreen=pause_on_fullscreen,
+                scale_mode=scale_mode,
                 wait=wait,
             )
 
-    pid = _launch_daemon(config_path, video_path, playback_speed, volume)
+    pid = _launch_daemon(
+        config_path,
+        video_path,
+        playback_speed,
+        volume,
+        blend_interpolation,
+        pause_on_fullscreen,
+        scale_mode,
+    )
     _write_pid(pid)
     _await_pid(pid, wait)
     _cleanup_orphaned_daemons(keep={pid})
@@ -324,7 +562,7 @@ def stop_daemon(timeout: float = 1.5) -> None:
     pid = read_pid()
     if pid is not None:
         _terminate_pid(pid, timeout=timeout)
-    for path in (PID_PATH, DAEMON_PAUSED_PATH, DAEMON_COMMAND_PATH):
+    for path in (PID_PATH, DAEMON_PAUSED_PATH, DAEMON_COMMAND_PATH, DAEMON_HEALTH_PATH):
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -338,6 +576,9 @@ def restart_daemon(
     video_path: Optional[str] = None,
     playback_speed: Optional[float] = None,
     volume: Optional[float] = None,
+    blend_interpolation: Optional[bool] = None,
+    pause_on_fullscreen: Optional[bool] = None,
+    scale_mode: Optional[str] = None,
     wait: float = 0.5,
 ) -> int:
     """Convenience helper to restart the daemon with updated parameters."""
@@ -348,8 +589,110 @@ def restart_daemon(
         video_path=video_path,
         playback_speed=playback_speed,
         volume=volume,
+        blend_interpolation=blend_interpolation,
+        pause_on_fullscreen=pause_on_fullscreen,
+        scale_mode=scale_mode,
         wait=wait,
     )
+
+
+def daemon_resource_metrics() -> dict:
+    """
+    Return lightweight daemon resource usage and playback health.
+    """
+
+    active_pids = sorted(_list_daemon_pids())
+    pid = _resolve_primary_daemon_pid() if active_pids else None
+    alive = pid is not None
+    paused = daemon_paused() if alive else False
+    health = daemon_health(alive=alive, paused=paused)
+    payload = {
+        "contract_version": 2,
+        "updated_at": time.time(),
+        "running": bool(alive and not paused),
+        "paused": bool(paused),
+        "pid": pid,
+        "daemon_pids": active_pids,
+        "process_count": len(active_pids),
+        "cpu_percent": 0.0,
+        "memory_mb": 0.0,
+        "thread_count": 0,
+        "health": health,
+    }
+
+    if not alive or not active_pids:
+        return payload
+
+    ps_targets = ",".join(str(current_pid) for current_pid in active_pids)
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["ps", "-p", ps_targets, "-o", "pid=,%cpu=,rss="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return payload
+
+    if result.returncode != 0:
+        return payload
+
+    lines = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
+    if not lines:
+        return payload
+
+    total_cpu = 0.0
+    total_memory_mb = 0.0
+    total_threads = 0
+    counted = 0
+
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            current_pid = int(parts[0])
+            cpu = float(parts[1])
+            memory_mb = float(parts[2]) / 1024.0
+        except ValueError:
+            continue
+
+        total_cpu += cpu
+        total_memory_mb += memory_mb
+        total_threads += _thread_count_for_pid(current_pid)
+        counted += 1
+
+    if counted == 0:
+        return payload
+
+    payload["cpu_percent"] = total_cpu
+    payload["memory_mb"] = total_memory_mb
+    payload["thread_count"] = total_threads
+    return payload
+
+
+def _thread_count_for_pid(pid: int) -> int:
+    """
+    Return thread count for a PID on macOS using ``ps -M``.
+    """
+
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["ps", "-M", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return 0
+
+    if result.returncode != 0:
+        return 0
+
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return 0
+    return len(lines) - 1
 
 
 def _build_launch_agent_plist(config_path: Path) -> dict:

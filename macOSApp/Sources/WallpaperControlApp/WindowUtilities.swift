@@ -7,13 +7,17 @@ func configureWindowForClientDecorations(_ window: NSWindow) {
     window.tabbingMode = .disallowed
     window.titleVisibility = .hidden
     window.titlebarAppearsTransparent = true
+    window.styleMask.insert(.titled)
+    window.styleMask.insert(.closable)
+    window.styleMask.insert(.miniaturizable)
+    window.styleMask.insert(.resizable)
     window.styleMask.insert(.fullSizeContentView)
-    window.isMovableByWindowBackground = true
+    window.isMovableByWindowBackground = false
     window.isOpaque = false
     window.backgroundColor = .clear
-    window.standardWindowButton(.closeButton)?.isHidden = true
-    window.standardWindowButton(.miniaturizeButton)?.isHidden = true
-    window.standardWindowButton(.zoomButton)?.isHidden = true
+    window.standardWindowButton(.closeButton)?.isHidden = false
+    window.standardWindowButton(.miniaturizeButton)?.isHidden = false
+    window.standardWindowButton(.zoomButton)?.isHidden = false
 }
 
 func mainScreenAspectRatio() -> CGFloat {
