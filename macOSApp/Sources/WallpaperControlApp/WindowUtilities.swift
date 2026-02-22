@@ -2,8 +2,19 @@ import AppKit
 
 let auraFlowMainWindowIdentifier = NSUserInterfaceItemIdentifier("AuraFlowMainWindow")
 
+private final class AuraFlowMainWindowDelegate: NSObject, NSWindowDelegate {
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
+}
+
+private let auraFlowMainWindowDelegate = AuraFlowMainWindowDelegate()
+
 func configureWindowForClientDecorations(_ window: NSWindow) {
     window.identifier = auraFlowMainWindowIdentifier
+    window.isReleasedWhenClosed = false
+    window.delegate = auraFlowMainWindowDelegate
     window.tabbingMode = .disallowed
     window.titleVisibility = .hidden
     window.titlebarAppearsTransparent = true
@@ -11,9 +22,9 @@ func configureWindowForClientDecorations(_ window: NSWindow) {
     window.isMovableByWindowBackground = true
     window.isOpaque = false
     window.backgroundColor = .clear
-    window.standardWindowButton(.closeButton)?.isHidden = true
-    window.standardWindowButton(.miniaturizeButton)?.isHidden = true
-    window.standardWindowButton(.zoomButton)?.isHidden = true
+    window.standardWindowButton(.closeButton)?.isHidden = false
+    window.standardWindowButton(.miniaturizeButton)?.isHidden = false
+    window.standardWindowButton(.zoomButton)?.isHidden = false
 }
 
 func mainScreenAspectRatio() -> CGFloat {
@@ -30,12 +41,13 @@ func preferredWindowSize() -> CGSize {
     return CGSize(width: width, height: height)
 }
 
-func bringMainWindowToFront() {
+@discardableResult
+func bringMainWindowToFront() -> Bool {
     NSApp.activate(ignoringOtherApps: true)
 
     let targetWindow = NSApp.windows.first { $0.identifier == auraFlowMainWindowIdentifier }
     guard let window = targetWindow ?? NSApp.windows.first else {
-        return
+        return false
     }
 
     if window.isMiniaturized {
@@ -44,4 +56,5 @@ func bringMainWindowToFront() {
 
     window.makeKeyAndOrderFront(nil)
     window.orderFrontRegardless()
+    return true
 }

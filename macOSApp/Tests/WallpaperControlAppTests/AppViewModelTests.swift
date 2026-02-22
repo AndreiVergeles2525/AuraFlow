@@ -20,6 +20,26 @@ import AVFoundation
     #expect(viewModel.previewPlayer?.currentItem != nil)
 }
 
+@MainActor
+@Test func catalogBackNavigatesDetailThenExitsCatalog() throws {
+    let controller = MockPythonController()
+    let viewModel = AppViewModel(controller: controller)
+
+    viewModel.openCatalog()
+    #expect(viewModel.isCatalogOpen)
+
+    let wallpaper = try #require(viewModel.catalogWallpapers.first)
+    viewModel.openCatalogWallpaper(wallpaper)
+    #expect(viewModel.selectedCatalogWallpaper == wallpaper)
+
+    viewModel.navigateBackFromCatalog()
+    #expect(viewModel.selectedCatalogWallpaper == nil)
+    #expect(viewModel.isCatalogOpen)
+
+    viewModel.navigateBackFromCatalog()
+    #expect(viewModel.isCatalogOpen == false)
+}
+
 final class MockPythonController: PythonControlling {
     func status() throws -> ControlStatus {
         ControlStatus(

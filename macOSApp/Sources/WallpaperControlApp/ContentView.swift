@@ -52,13 +52,6 @@ struct ContentView: View {
             .opacity(controlsVisible ? 1 : 0)
             .animation(.easeInOut(duration: 0.3), value: controlsVisible)
 
-            WindowControls(window: $window)
-                .padding(.top, 18)
-                .padding(.leading, 24)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .opacity(controlsVisible ? 1 : 0)
-                .animation(.easeInOut(duration: 0.3), value: controlsVisible)
-
             if !viewModel.isCatalogOpen {
                 SpeedOverlay(viewModel: viewModel, isAdjustingSpeed: $isAdjustingSpeed)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -76,6 +69,9 @@ struct ContentView: View {
         .onAppear {
             handleUserActivity()
             setupActivityMonitoring()
+        }
+        .onChange(of: viewModel.isCatalogOpen) { isOpen in
+            handleCatalogVisibilityChange(isOpen)
         }
         .onDisappear {
             teardownActivityMonitoring()
@@ -216,6 +212,7 @@ struct WallpaperCatalogView: View {
                     Label("Back", systemImage: "chevron.left")
                 }
                 .buttonStyle(.bordered)
+                .keyboardShortcut(.escape, modifiers: [])
 
                 Text(viewModel.selectedCatalogWallpaper?.title ?? "Wallpaper Catalog")
                     .font(.headline.weight(.semibold))
@@ -457,37 +454,6 @@ struct VisualEffectView: NSViewRepresentable {
     }
 }
 
-struct WindowControls: View {
-    @Binding var window: NSWindow?
-
-    var body: some View {
-        HStack(spacing: 9) {
-            WindowControlButton(color: Color(red: 1, green: 0.33, blue: 0.31)) {
-                window?.orderOut(nil)
-            }
-            WindowControlButton(color: Color(red: 1, green: 0.80, blue: 0.25)) {
-                window?.miniaturize(nil)
-            }
-            WindowControlButton(color: Color(red: 0.26, green: 0.86, blue: 0.39)) {
-                window?.zoom(nil)
-            }
-        }
-    }
-}
-
-struct WindowControlButton: View {
-    let color: Color
-    let action: () -> Void
-
-    var body: some View {
-        Circle()
-            .fill(color)
-            .frame(width: 13, height: 13)
-            .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 0.6))
-            .onTapGesture { action() }
-    }
-}
-
 struct DisabledOverlay: View {
     var body: some View {
         RoundedRectangle(cornerRadius: 22, style: .continuous)
@@ -552,6 +518,17 @@ struct WindowAccessor: NSViewRepresentable {
 }
 
 private extension ContentView {
+    func handleCatalogVisibilityChange(_ isCatalogOpen: Bool) {
+        hideWorkItem?.cancel()
+        hideWorkItem = nil
+        withAnimation(.easeInOut(duration: 0.2)) {
+            controlsVisible = true
+        }
+        if !isCatalogOpen {
+            handleUserActivity()
+        }
+    }
+
     func setupActivityMonitoring() {
         teardownActivityMonitoring()
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .keyDown]) { event in

@@ -8,7 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSWindow.allowsAutomaticWindowTabbing = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            bringMainWindowToFront()
+            _ = bringMainWindowToFront()
         }
     }
 
@@ -17,7 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        bringMainWindowToFront()
+        _ = bringMainWindowToFront()
         return true
     }
 }
@@ -101,11 +101,12 @@ private struct MenuBarControls: View {
     }
 
     private func openMainWindow() {
-        if NSApp.windows.first(where: { $0.identifier == auraFlowMainWindowIdentifier }) == nil {
-            openWindow(id: WallpaperControlApp.mainWindowID)
+        if bringMainWindowToFront() {
+            return
         }
+        openWindow(id: WallpaperControlApp.mainWindowID)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            bringMainWindowToFront()
+            _ = bringMainWindowToFront()
         }
     }
 
