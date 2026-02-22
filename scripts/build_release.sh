@@ -8,6 +8,8 @@ PYTHON_DIR="$ROOT_DIR/python"
 DIST_DIR="$ROOT_DIR/dist"
 APP_TARGET="WallpaperControlApp"
 APP_DISPLAY_NAME="AuraFlow"
+APP_VERSION="${AURAFLOW_VERSION:-1.1.0}"
+APP_BUILD="${AURAFLOW_BUILD:-1}"
 APP_BUNDLE="$DIST_DIR/${APP_DISPLAY_NAME}.app"
 APP_ZIP="$DIST_DIR/${APP_DISPLAY_NAME}.zip"
 APP_DMG="$DIST_DIR/${APP_DISPLAY_NAME}.dmg"
@@ -179,6 +181,8 @@ apply_plist_customizations() {
   plist_set_string "$plist" CFBundleName "$APP_DISPLAY_NAME"
   plist_set_string "$plist" CFBundleDisplayName "$APP_DISPLAY_NAME"
   plist_set_string "$plist" CFBundleIdentifier "com.example.auraflow"
+  plist_set_string "$plist" CFBundleShortVersionString "$APP_VERSION"
+  plist_set_string "$plist" CFBundleVersion "$APP_BUILD"
   plist_set_bool "$plist" LSUIElement true
 
   /usr/libexec/PlistBuddy -c "Delete :LSEnvironment" "$plist" 2>/dev/null || true
