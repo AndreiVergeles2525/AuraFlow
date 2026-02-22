@@ -16,15 +16,17 @@ from typing import Any, Dict, Optional
 
 from daemon_manager import (
     autostart_enabled,
+    daemon_paused,
     disable_autostart,
     enable_autostart,
+    pause_daemon,
     restart_daemon,
     start_daemon,
     stop_daemon,
     daemon_running,
 )
 from paths import CONFIG_PATH, ensure_app_support_dir
-from wallpaper_utils import set_wallpaper_from_video, validate_video
+from wallpaper_utils import restore_wallpaper_backup, set_wallpaper_from_video, validate_video
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -60,36 +62,45 @@ def update_config(updates: Dict[str, Any], path: Path = CONFIG_PATH) -> Dict[str
 def build_status(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if config is None:
         config = load_config()
+    alive = daemon_running()
+    paused = daemon_paused()
     return {
-        "running": daemon_running(),
+        "running": alive and not paused,
         "config": config,
-        "pid": load_pid(),
+        "pid": load_pid() if alive else None,
         "autostart": autostart_enabled(),
+        "paused": paused,
     }
 
 
 def command_start(args):
     config = load_config()
+    overrides_applied = False
     if args.video:
         video_path = str(validate_video(args.video))
         config = update_config({"video_path": video_path}, CONFIG_PATH)
         set_wallpaper_from_video(Path(video_path))
+        overrides_applied = True
     if args.speed is not None:
         config = update_config({"playback_speed": args.speed}, CONFIG_PATH)
+        overrides_applied = True
     if not config["video_path"]:
         raise SystemExit("No video configured. Use 'set-video' first or pass --video.")
 
-    start_daemon(
-        video_path=config["video_path"],
-        playback_speed=config["playback_speed"],
-        volume=config.get("volume", 0.0),
-        wait=0.35,
-    )
+    if overrides_applied:
+        start_daemon(
+            video_path=config["video_path"],
+            playback_speed=config["playback_speed"],
+            volume=config.get("volume", 0.0),
+            wait=0.35,
+        )
+    else:
+        start_daemon(wait=0.35)
     print(json.dumps(build_status(config)))
 
 
 def command_stop(_args):
-    stop_daemon()
+    pause_daemon()
     print(json.dumps(build_status()))
 
 
@@ -124,9 +135,22 @@ def command_set_speed(args):
     print(json.dumps(build_status(config)))
 
 
+def command_clear_wallpaper(_args):
+    stop_daemon()
+    restored = restore_wallpaper_backup(delete_backup=False)
+    payload = build_status()
+    payload["wallpaper_restored"] = restored
+    print(json.dumps(payload))
+
+
 def command_autostart(args):
     config = load_config()
     if args.state == "on":
+        if not config.get("video_path"):
+            raise SystemExit("Choose a video before enabling launch at login.")
+        video_path = validate_video(config["video_path"])
+        if not daemon_running():
+            set_wallpaper_from_video(video_path)
         enable_autostart()
         config = update_config({"autostart": True}, CONFIG_PATH)
     else:
@@ -168,6 +192,12 @@ def build_parser():
     speed_parser = subparsers.add_parser("set-speed", help="Adjust playback speed.")
     speed_parser.add_argument("speed", type=float, help="New playback speed.")
     speed_parser.set_defaults(func=command_set_speed)
+
+    clear_parser = subparsers.add_parser(
+        "clear-wallpaper",
+        help="Stop playback and restore the previously configured macOS wallpaper.",
+    )
+    clear_parser.set_defaults(func=command_clear_wallpaper)
 
     auto_parser = subparsers.add_parser("set-autostart", help="Toggle autostart.")
     auto_parser.add_argument(

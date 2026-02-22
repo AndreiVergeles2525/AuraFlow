@@ -19,15 +19,21 @@ from pathlib import Path
 from typing import Optional
 
 import objc
-from Foundation import NSObject, NSURL
+from Foundation import NSObject, NSURL, NSNotificationCenter
 from PyObjCTools import AppHelper
 
 import AppKit
 import AVFoundation
-import AVKit
+import CoreMedia
 import Quartz
 
-from paths import CONFIG_PATH, ensure_app_support_dir, PID_PATH
+from paths import (
+    CONFIG_PATH,
+    DAEMON_COMMAND_PATH,
+    DAEMON_PAUSED_PATH,
+    ensure_app_support_dir,
+    PID_PATH,
+)
 
 
 @dataclass
@@ -69,24 +75,40 @@ class AuraFlowController(NSObject):
 
         self._config = config
         self._windows = []
-        self._player_views = []
+        self._layer_views = []
+        self._player_layers = []
+        self._is_paused = False
 
-        self._player = AVFoundation.AVQueuePlayer.queuePlayerWithItems_([])
-        self._looper = None
+        self._player = AVFoundation.AVPlayer.alloc().init()
         self._apply_config(config)
         return self
 
     def _apply_config(self, config: DaemonConfig):
         """Create player items and windows for the provided config."""
 
+        self._is_paused = False
         url = config.video_url
-        template_item = AVFoundation.AVPlayerItem.playerItemWithURL_(url)
-        self._player.removeAllItems()
-        self._looper = AVFoundation.AVPlayerLooper.playerLooperWithPlayer_templateItem_(
-            self._player, template_item
+        asset = AVFoundation.AVURLAsset.URLAssetWithURL_options_(
+            url,
+            {AVFoundation.AVURLAssetPreferPreciseDurationAndTimingKey: True},
+        )
+        player_item = AVFoundation.AVPlayerItem.playerItemWithAsset_(asset)
+        try:
+            player_item.setPreferredForwardBufferDuration_(2.0)
+        except Exception:
+            pass
+
+        NSNotificationCenter.defaultCenter().removeObserver_(self)
+        self._player.replaceCurrentItemWithPlayerItem_(player_item)
+        NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            self,
+            "playerItemDidReachEnd:",
+            AVFoundation.AVPlayerItemDidPlayToEndTimeNotification,
+            player_item,
         )
 
         self._player.setActionAtItemEnd_(AVFoundation.AVPlayerActionAtItemEndNone)
+        self._player.setAutomaticallyWaitsToMinimizeStalling_(False)
         self._player.setVolume_(max(0.0, min(config.volume, 1.0)))
 
         self._teardown_windows()
@@ -94,6 +116,44 @@ class AuraFlowController(NSObject):
 
         self._player.play()
         self._player.setRate_(max(0.1, config.playback_speed))
+
+    def playerItemDidReachEnd_(self, _notification):
+        """Loop playback manually for reliability across variable video formats."""
+
+        if self._player is None or self._is_paused:
+            return
+        try:
+            self._player.seekToTime_toleranceBefore_toleranceAfter_(
+                CoreMedia.kCMTimeZero,
+                CoreMedia.kCMTimeZero,
+                CoreMedia.kCMTimeZero,
+            )
+        except Exception:
+            pass
+        self._player.play()
+        self._player.setRate_(max(0.1, self._config.playback_speed))
+
+    def ensurePlaybackIsActive(self):
+        """Recover from transient AVPlayer stalls without changing UI state."""
+
+        if self._player is None or self._is_paused:
+            return
+
+        try:
+            rate = float(self._player.rate())
+        except Exception:
+            rate = 0.0
+
+        if rate > 0.01:
+            return
+
+        current_item = self._player.currentItem()
+        if current_item is None:
+            self._apply_config(self._config)
+            return
+
+        self._player.play()
+        self._player.setRate_(max(0.1, self._config.playback_speed))
 
     def updateWithConfig_(self, config: DaemonConfig):
         """Replace playback content and parameters."""
@@ -123,27 +183,36 @@ class AuraFlowController(NSObject):
                 )
             )
             window.setReleasedWhenClosed_(False)
-            window.setBackgroundColor_(AppKit.NSColor.blackColor())
+            window.setBackgroundColor_(AppKit.NSColor.clearColor())
             window.setLevel_(desktop_level)
-            window.setOpaque_(True)
+            window.setOpaque_(False)
             window.setHasShadow_(False)
             window.setCollectionBehavior_(behavior_flags)
             window.setIgnoresMouseEvents_(True)
 
-            player_view = AVKit.AVPlayerView.alloc().initWithFrame_(frame)
-            player_view.setPlayer_(self._player)
-            player_view.setControlsStyle_(AVKit.AVPlayerViewControlsStyleNone)
-            player_view.setVideoGravity_(AVFoundation.AVLayerVideoGravityResizeAspectFill)
-            player_view.setAutoresizingMask_(
+            layer_view = AppKit.NSView.alloc().initWithFrame_(frame)
+            layer_view.setWantsLayer_(True)
+            layer_view.setAutoresizingMask_(
                 AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable
             )
+            layer_view.layer().setBackgroundColor_(AppKit.NSColor.clearColor().CGColor())
 
-            window.setContentView_(player_view)
+            player_layer = AVFoundation.AVPlayerLayer.playerLayerWithPlayer_(self._player)
+            player_layer.setVideoGravity_(AVFoundation.AVLayerVideoGravityResizeAspectFill)
+            player_layer.setFrame_(layer_view.bounds())
+            player_layer.setNeedsDisplayOnBoundsChange_(True)
+            player_layer.setAutoresizingMask_(
+                Quartz.kCALayerWidthSizable | Quartz.kCALayerHeightSizable
+            )
+            layer_view.layer().addSublayer_(player_layer)
+
+            window.setContentView_(layer_view)
             window.orderBack_(None)
             window.orderFrontRegardless()
 
             self._windows.append(window)
-            self._player_views.append(player_view)
+            self._layer_views.append(layer_view)
+            self._player_layers.append(player_layer)
 
     def _teardown_windows(self):
         """Destroy existing wallpaper windows."""
@@ -152,7 +221,8 @@ class AuraFlowController(NSObject):
             window.orderOut_(None)
 
         self._windows.clear()
-        self._player_views.clear()
+        self._layer_views.clear()
+        self._player_layers.clear()
 
     def stop(self):
         """Stop playback and close windows."""
@@ -160,16 +230,36 @@ class AuraFlowController(NSObject):
         if self._player is None:
             return
 
+        NSNotificationCenter.defaultCenter().removeObserver_(self)
         self._player.pause()
-        self._looper = None
+        self._player.replaceCurrentItemWithPlayerItem_(None)
         self._teardown_windows()
         self._player = None
+
+    def pause(self):
+        """Pause playback on the currently rendered frame."""
+
+        if self._player is None:
+            return
+        self._is_paused = True
+        self._player.pause()
+
+    def resume(self):
+        """Resume playback after pause."""
+
+        if self._player is None:
+            return
+        self._is_paused = False
+        self._player.play()
+        self._player.setRate_(max(0.1, self._config.playback_speed))
 
 
 class WallpaperAppDelegate(NSObject):
     """NSApplication delegate that wires the wallpaper controller."""
 
     controller = objc.ivar()
+    commandTimer = objc.ivar()
+    playbackTimer = objc.ivar()
 
     def initWithConfig_(self, config: DaemonConfig):
         self = objc.super(WallpaperAppDelegate, self).init()
@@ -180,18 +270,78 @@ class WallpaperAppDelegate(NSObject):
 
     def applicationDidFinishLaunching_(self, _notification):
         self.controller = AuraFlowController.alloc().initWithConfig_(self._config)
+        DAEMON_PAUSED_PATH.unlink(missing_ok=True)
+        DAEMON_COMMAND_PATH.unlink(missing_ok=True)
+        self.commandTimer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.25,
+            self,
+            "pollCommand:",
+            None,
+            True,
+        )
+        self.playbackTimer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0,
+            self,
+            "pollPlayback:",
+            None,
+            True,
+        )
         write_pid_file()
 
     def applicationShouldTerminate_(self, _sender):
+        if self.commandTimer is not None:
+            self.commandTimer.invalidate()
+            self.commandTimer = None
+        if self.playbackTimer is not None:
+            self.playbackTimer.invalidate()
+            self.playbackTimer = None
         if self.controller is not None:
             self.controller.stop()
+        DAEMON_PAUSED_PATH.unlink(missing_ok=True)
+        DAEMON_COMMAND_PATH.unlink(missing_ok=True)
         remove_pid_file()
         return AppKit.NSTerminateNow
 
     def applicationWillTerminate_(self, _notification):
+        if self.commandTimer is not None:
+            self.commandTimer.invalidate()
+            self.commandTimer = None
+        if self.playbackTimer is not None:
+            self.playbackTimer.invalidate()
+            self.playbackTimer = None
         if self.controller is not None:
             self.controller.stop()
+        DAEMON_PAUSED_PATH.unlink(missing_ok=True)
+        DAEMON_COMMAND_PATH.unlink(missing_ok=True)
         remove_pid_file()
+
+    def pausePlayback(self):
+        if self.controller is not None:
+            self.controller.pause()
+
+    def resumePlayback(self):
+        if self.controller is not None:
+            self.controller.resume()
+
+    def pollCommand_(self, _timer):
+        if not DAEMON_COMMAND_PATH.exists():
+            return
+        try:
+            command = DAEMON_COMMAND_PATH.read_text(encoding="utf-8").strip().lower()
+        except OSError:
+            return
+        DAEMON_COMMAND_PATH.unlink(missing_ok=True)
+
+        if command == "pause":
+            self.pausePlayback()
+            DAEMON_PAUSED_PATH.write_text("1", encoding="utf-8")
+        elif command == "resume":
+            self.resumePlayback()
+            DAEMON_PAUSED_PATH.unlink(missing_ok=True)
+
+    def pollPlayback_(self, _timer):
+        if self.controller is not None:
+            self.controller.ensurePlaybackIsActive()
 
 
 def write_pid_file():

@@ -46,10 +46,11 @@ class ControlCLITests(unittest.TestCase):
 
     def test_command_stop_invokes_manager(self):
         args = Namespace()
-        with mock.patch.object(control, "stop_daemon") as stop:
-            with mock.patch("builtins.print") as printer:
-                control.command_stop(args)
-        stop.assert_called_once()
+        with mock.patch.object(control, "pause_daemon") as pause:
+            with mock.patch.object(control, "build_status", return_value={"running": False, "config": {}, "pid": None, "autostart": False, "paused": True}):
+                with mock.patch("builtins.print") as printer:
+                    control.command_stop(args)
+        pause.assert_called_once()
         printer.assert_called_once()
 
     def test_command_set_video_restarts_daemon(self):
@@ -68,13 +69,50 @@ class ControlCLITests(unittest.TestCase):
 
     def test_command_autostart_toggle(self):
         args = Namespace(state="on")
-        with mock.patch.object(control, "load_config", return_value={"autostart": False}):
-            with mock.patch.object(control, "update_config", return_value={"autostart": True}):
-                with mock.patch.object(control, "enable_autostart") as enable:
-                    with mock.patch.object(control, "build_status", return_value={"running": False, "config": {}, "pid": None, "autostart": True}):
-                        with mock.patch("builtins.print") as printer:
-                            control.command_autostart(args)
+        with mock.patch.object(control, "load_config", return_value={"autostart": False, "video_path": "/tmp/video.mp4"}):
+            with mock.patch.object(control, "validate_video", return_value=Path("/tmp/video.mp4")) as validate:
+                with mock.patch.object(control, "daemon_running", return_value=False):
+                    with mock.patch.object(control, "set_wallpaper_from_video") as set_wallpaper:
+                        with mock.patch.object(control, "update_config", return_value={"autostart": True}):
+                            with mock.patch.object(control, "enable_autostart") as enable:
+                                with mock.patch.object(control, "build_status", return_value={"running": False, "config": {}, "pid": None, "autostart": True}):
+                                    with mock.patch("builtins.print") as printer:
+                                        control.command_autostart(args)
+        validate.assert_called_once()
+        set_wallpaper.assert_called_once_with(Path("/tmp/video.mp4"))
         enable.assert_called_once()
+        printer.assert_called_once()
+
+    def test_command_autostart_does_not_touch_wallpaper_when_running(self):
+        args = Namespace(state="on")
+        with mock.patch.object(control, "load_config", return_value={"autostart": False, "video_path": "/tmp/video.mp4"}):
+            with mock.patch.object(control, "validate_video", return_value=Path("/tmp/video.mp4")) as validate:
+                with mock.patch.object(control, "daemon_running", return_value=True):
+                    with mock.patch.object(control, "set_wallpaper_from_video") as set_wallpaper:
+                        with mock.patch.object(control, "update_config", return_value={"autostart": True}):
+                            with mock.patch.object(control, "enable_autostart") as enable:
+                                with mock.patch.object(control, "build_status", return_value={"running": True, "config": {}, "pid": 1, "autostart": True}):
+                                    with mock.patch("builtins.print"):
+                                        control.command_autostart(args)
+        validate.assert_called_once()
+        set_wallpaper.assert_not_called()
+        enable.assert_called_once()
+
+    def test_command_autostart_requires_video(self):
+        args = Namespace(state="on")
+        with mock.patch.object(control, "load_config", return_value={"autostart": False, "video_path": ""}):
+            with self.assertRaises(SystemExit):
+                control.command_autostart(args)
+
+    def test_command_clear_wallpaper_restores_previous(self):
+        args = Namespace()
+        with mock.patch.object(control, "stop_daemon") as stop:
+            with mock.patch.object(control, "restore_wallpaper_backup", return_value=True) as restore:
+                with mock.patch.object(control, "build_status", return_value={"running": False, "config": {}, "pid": None, "autostart": False}):
+                    with mock.patch("builtins.print") as printer:
+                        control.command_clear_wallpaper(args)
+        stop.assert_called_once()
+        restore.assert_called_once_with(delete_backup=False)
         printer.assert_called_once()
 
 

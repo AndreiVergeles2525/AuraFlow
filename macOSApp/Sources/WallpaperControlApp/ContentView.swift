@@ -29,18 +29,22 @@ struct ContentView: View {
                         .padding(.bottom, 12)
                 }
 
-                ControlPanel(
-                    viewModel: viewModel,
-                    isAdjustingSpeed: $isAdjustingSpeed
-                )
-                .disabled(!viewModel.isControllerAvailable)
-                .overlay(
-                    Group {
-                        if !viewModel.isControllerAvailable {
-                            DisabledOverlay()
+                if viewModel.isCatalogOpen {
+                    WallpaperCatalogView(viewModel: viewModel)
+                } else {
+                    ControlPanel(
+                        viewModel: viewModel,
+                        isAdjustingSpeed: $isAdjustingSpeed
+                    )
+                    .disabled(!viewModel.isControllerAvailable)
+                    .overlay(
+                        Group {
+                            if !viewModel.isControllerAvailable {
+                                DisabledOverlay()
+                            }
                         }
-                    }
-                )
+                    )
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 24)
@@ -55,11 +59,13 @@ struct ContentView: View {
                 .opacity(controlsVisible ? 1 : 0)
                 .animation(.easeInOut(duration: 0.3), value: controlsVisible)
 
-            SpeedOverlay(viewModel: viewModel, isAdjustingSpeed: $isAdjustingSpeed)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .padding(.top, 18)
-                .opacity(controlsVisible ? 1 : 0)
-                .animation(.easeInOut(duration: 0.3), value: controlsVisible)
+            if !viewModel.isCatalogOpen {
+                SpeedOverlay(viewModel: viewModel, isAdjustingSpeed: $isAdjustingSpeed)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.top, 18)
+                    .opacity(controlsVisible ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.3), value: controlsVisible)
+            }
         }
         .frame(minWidth: 760, minHeight: 480)
         .background(Color.clear)
@@ -98,19 +104,26 @@ struct ControlPanel: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center, spacing: 16) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Видео")
+                    Text("Video")
                         .font(.headline.weight(.semibold))
-                    Text(viewModel.videoURL?.lastPathComponent ?? "Не выбрано")
+                    Text(viewModel.selectedVideoName)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
                 Spacer()
-                Button("Выбрать…") {
+                Button("Wallpaper Catalog") {
+                    viewModel.openCatalog()
+                }
+                .buttonStyle(.bordered)
+                .disabled(!viewModel.canClearWallpaper)
+
+                Button("Change Wallpaper…") {
                     viewModel.chooseVideo()
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(!viewModel.canClearWallpaper)
             }
 
             ControlButtons(viewModel: viewModel)
@@ -120,10 +133,11 @@ struct ControlPanel: View {
                     get: { viewModel.autostartEnabled },
                     set: { newValue in viewModel.toggleAutostart(newValue) }
                 )) {
-                    Label("Автозапуск", systemImage: "power")
+                    Label("Launch at Login", systemImage: "power")
                         .labelStyle(.titleAndIcon)
                 }
                 .toggleStyle(.switch)
+                .disabled(!viewModel.canToggleAutostart)
 
                 Spacer()
 
@@ -158,32 +172,202 @@ struct ControlButtons: View {
             Spacer()
 
             Button {
-                viewModel.preview()
-            } label: {
-                Label("Предпросмотр", systemImage: "play.rectangle")
-                    .frame(minWidth: 130)
-            }
-            .buttonStyle(.bordered)
-
-            Button {
                 viewModel.start()
             } label: {
-                Label("Старт", systemImage: "desktopcomputer")
+                Label("Start", systemImage: "desktopcomputer")
                     .frame(minWidth: 96)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(viewModel.isRunning)
+            .disabled(!viewModel.canStart)
 
             Button(role: .destructive) {
                 viewModel.stop()
             } label: {
-                Label("Стоп", systemImage: "stop.circle")
+                Label("Stop", systemImage: "stop.circle")
                     .frame(minWidth: 96)
             }
             .buttonStyle(.bordered)
-            .disabled(!viewModel.isRunning)
+            .disabled(!viewModel.canStop)
+
+            Button(role: .destructive) {
+                viewModel.clearWallpaper()
+            } label: {
+                Label("Remove Wallpaper", systemImage: "photo.slash")
+                    .frame(minWidth: 140)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!viewModel.canClearWallpaper)
 
             Spacer()
+        }
+    }
+}
+
+struct WallpaperCatalogView: View {
+    @ObservedObject var viewModel: AppViewModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Button {
+                    viewModel.navigateBackFromCatalog()
+                } label: {
+                    Label("Back", systemImage: "chevron.left")
+                }
+                .buttonStyle(.bordered)
+
+                Text(viewModel.selectedCatalogWallpaper?.title ?? "Wallpaper Catalog")
+                    .font(.headline.weight(.semibold))
+
+                Spacer()
+
+                if viewModel.selectedCatalogWallpaper == nil {
+                    TextField("Search catalog", text: $viewModel.catalogSearchText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 260)
+                }
+            }
+
+            if let wallpaper = viewModel.selectedCatalogWallpaper {
+                WallpaperCatalogDetailView(viewModel: viewModel, wallpaper: wallpaper)
+            } else {
+                WallpaperCatalogGridView(viewModel: viewModel)
+            }
+        }
+        .padding(.vertical, 14)
+        .padding(.horizontal, 18)
+        .frame(maxWidth: .infinity, maxHeight: 320, alignment: .topLeading)
+        .background(
+            LiquidGlassView()
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(colorScheme == .dark ? 0.12 : 0.16), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.35 : 0.25), radius: 16, x: 0, y: 10)
+    }
+}
+
+struct WallpaperCatalogGridView: View {
+    @ObservedObject var viewModel: AppViewModel
+
+    private let columns = [GridItem(.adaptive(minimum: 220), spacing: 12)]
+
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 12) {
+                ForEach(viewModel.filteredCatalogWallpapers) { wallpaper in
+                    Button {
+                        viewModel.openCatalogWallpaper(wallpaper)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 8) {
+                            CatalogPreviewImage(url: wallpaper.previewImageURL, title: wallpaper.title)
+                                .frame(height: 96)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                            Text(wallpaper.title)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(1)
+                            Text(wallpaper.category)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(Color.black.opacity(0.15))
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+}
+
+struct WallpaperCatalogDetailView: View {
+    @ObservedObject var viewModel: AppViewModel
+    let wallpaper: CatalogWallpaper
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            CatalogPreviewImage(url: wallpaper.previewImageURL, title: wallpaper.title)
+                .frame(height: 150)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            Text(wallpaper.title)
+                .font(.headline)
+
+            Text("Category: \(wallpaper.category) • Source: \(wallpaper.attribution)")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            HStack(spacing: 10) {
+                Button {
+                    viewModel.applyCatalogWallpaper(wallpaper)
+                } label: {
+                    if viewModel.isDownloading(wallpaper) {
+                        Label("Downloading…", systemImage: "arrow.down.circle")
+                    } else {
+                        Label("Download & Apply", systemImage: "arrow.down.circle")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!viewModel.canApplyCatalogWallpaper)
+
+                if let sourceURL = wallpaper.sourcePageURL {
+                    Button {
+                        NSWorkspace.shared.open(sourceURL)
+                    } label: {
+                        Label("Open Source", systemImage: "link")
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Spacer()
+            }
+        }
+    }
+}
+
+struct CatalogPreviewImage: View {
+    let url: URL?
+    let title: String
+
+    var body: some View {
+        Group {
+            if let url {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    default:
+                        previewFallback
+                    }
+                }
+            } else {
+                previewFallback
+            }
+        }
+    }
+
+    private var previewFallback: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color.blue.opacity(0.55), Color.cyan.opacity(0.35), Color.indigo.opacity(0.45)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundColor(.white)
+                .padding(8)
+                .lineLimit(2)
         }
     }
 }
@@ -195,7 +379,7 @@ struct SpeedOverlay: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            Label("Скорость", systemImage: "speedometer")
+            Label("Speed", systemImage: "speedometer")
                 .labelStyle(.titleAndIcon)
                 .foregroundStyle(.primary)
 
@@ -279,7 +463,7 @@ struct WindowControls: View {
     var body: some View {
         HStack(spacing: 9) {
             WindowControlButton(color: Color(red: 1, green: 0.33, blue: 0.31)) {
-                window?.performClose(nil)
+                window?.orderOut(nil)
             }
             WindowControlButton(color: Color(red: 1, green: 0.80, blue: 0.25)) {
                 window?.miniaturize(nil)
@@ -312,7 +496,7 @@ struct DisabledOverlay: View {
                 VStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.title3.weight(.semibold))
-                    Text("Python bridge недоступен")
+                    Text("Python bridge unavailable")
                         .font(.callout)
                         .foregroundColor(.white.opacity(0.92))
                 }
@@ -393,6 +577,15 @@ private extension ContentView {
     }
 
     func handleUserActivity() {
+        if viewModel.isCatalogOpen {
+            hideWorkItem?.cancel()
+            hideWorkItem = nil
+            withAnimation(.easeInOut(duration: 0.2)) {
+                controlsVisible = true
+            }
+            return
+        }
+
         hideWorkItem?.cancel()
         withAnimation(.easeInOut(duration: 0.25)) {
             controlsVisible = true

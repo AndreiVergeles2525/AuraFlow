@@ -18,6 +18,8 @@ from paths import (
     AGENT_PLIST_PATH,
     APP_ID,
     CONFIG_PATH,
+    DAEMON_COMMAND_PATH,
+    DAEMON_PAUSED_PATH,
     LOG_PATH,
     PID_PATH,
     ensure_app_support_dir,
@@ -35,6 +37,29 @@ def _python_executable() -> str:
 
 def _daemon_script() -> Path:
     return Path(__file__).resolve().parent / "wallpaper_daemon.py"
+
+
+def _python_environment() -> dict[str, str]:
+    script_dir = str(_daemon_script().parent)
+    site_packages_dir = str(_daemon_script().parent / "site-packages")
+
+    python_paths: list[str] = [script_dir]
+    if Path(site_packages_dir).exists():
+        python_paths.append(site_packages_dir)
+
+    existing = os.environ.get("PYTHONPATH")
+    if existing:
+        python_paths.append(existing)
+
+    env: dict[str, str] = {}
+    for key in ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+
+    env["PYTHONPATH"] = ":".join(python_paths)
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
 
 
 def _launchctl(args, *, ignore_errors: bool = False) -> bool:
@@ -145,9 +170,27 @@ def daemon_running() -> bool:
     if pid is None:
         return False
 
+    active = _list_daemon_pids()
+    if pid in active:
+        return True
+
     try:
-        os.kill(pid, 0)
+        PID_PATH.unlink(missing_ok=True)
     except OSError:
+        pass
+    return False
+
+
+def daemon_paused() -> bool:
+    """Return True when daemon process is alive and marked as paused."""
+
+    if not DAEMON_PAUSED_PATH.exists():
+        return False
+    if not daemon_running():
+        try:
+            DAEMON_PAUSED_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
         return False
     return True
 
@@ -164,6 +207,40 @@ def read_pid() -> Optional[int]:
 def _write_pid(pid: int) -> None:
     ensure_app_support_dir()
     PID_PATH.write_text(str(pid), encoding="utf-8")
+
+
+def pause_daemon() -> bool:
+    """Pause daemon playback while keeping wallpaper windows on screen."""
+
+    if not daemon_running():
+        return False
+
+    ensure_app_support_dir()
+    try:
+        DAEMON_COMMAND_PATH.write_text("pause", encoding="utf-8")
+    except OSError:
+        return False
+    DAEMON_PAUSED_PATH.write_text("1", encoding="utf-8")
+    return True
+
+
+def resume_daemon() -> bool:
+    """Resume daemon playback if it was paused."""
+
+    if not daemon_running():
+        try:
+            DAEMON_PAUSED_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+    ensure_app_support_dir()
+    try:
+        DAEMON_COMMAND_PATH.write_text("resume", encoding="utf-8")
+    except OSError:
+        return False
+    DAEMON_PAUSED_PATH.unlink(missing_ok=True)
+    return True
 
 
 def _launch_daemon(
@@ -194,6 +271,7 @@ def _launch_daemon(
         stderr=log_file,
         start_new_session=True,
         close_fds=True,
+        env=_python_environment(),
     )
     # PID file is written by the daemon shortly after launch.
     return process.pid
@@ -206,27 +284,32 @@ def start_daemon(
     volume: Optional[float] = None,
     wait: float = 0.5,
 ) -> int:
-    global _LAST_LAUNCH_SIGNATURE
-    signature = _launch_signature(config_path, video_path, playback_speed, volume)
-
     _cleanup_orphaned_daemons()
 
     if daemon_running():
-        if _LAST_LAUNCH_SIGNATURE == signature and PID_PATH.exists():
-            existing = read_pid()
-            if existing is not None:
+        existing = read_pid()
+        if existing is None:
+            # The process may have terminated between checks.
+            PID_PATH.unlink(missing_ok=True)
+        else:
+            if daemon_paused() and video_path is None and playback_speed is None and volume is None:
+                if resume_daemon():
+                    return existing
+
+            # Plain "start" while already running should be a no-op.
+            if video_path is None and playback_speed is None and volume is None:
                 return existing
-        return restart_daemon(
-            config_path=config_path,
-            video_path=video_path,
-            playback_speed=playback_speed,
-            volume=volume,
-            wait=wait,
-        )
+
+            return restart_daemon(
+                config_path=config_path,
+                video_path=video_path,
+                playback_speed=playback_speed,
+                volume=volume,
+                wait=wait,
+            )
 
     pid = _launch_daemon(config_path, video_path, playback_speed, volume)
     _write_pid(pid)
-    _LAST_LAUNCH_SIGNATURE = signature
     _await_pid(pid, wait)
     _cleanup_orphaned_daemons(keep={pid})
     return pid
@@ -241,7 +324,11 @@ def stop_daemon(timeout: float = 1.5) -> None:
     pid = read_pid()
     if pid is not None:
         _terminate_pid(pid, timeout=timeout)
-    PID_PATH.unlink(missing_ok=True)
+    for path in (PID_PATH, DAEMON_PAUSED_PATH, DAEMON_COMMAND_PATH):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            continue
     _cleanup_orphaned_daemons()
     return
 
@@ -275,6 +362,7 @@ def _build_launch_agent_plist(config_path: Path) -> dict:
             str(config_path),
             "run",
         ],
+        "EnvironmentVariables": _python_environment(),
         "RunAtLoad": True,
         "KeepAlive": False,
         "StandardOutPath": str(LOG_PATH),
@@ -283,7 +371,7 @@ def _build_launch_agent_plist(config_path: Path) -> dict:
 
 
 def enable_autostart(config_path: Path = CONFIG_PATH) -> None:
-    """Write the LaunchAgent plist and load it."""
+    """Write/update the LaunchAgent plist for the next user login."""
 
     ensure_app_support_dir()
     AGENT_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -293,9 +381,6 @@ def enable_autostart(config_path: Path = CONFIG_PATH) -> None:
     with plist_path_tmp.open("wb") as handle:
         plistlib.dump(plist, handle)
     plist_path_tmp.replace(AGENT_PLIST_PATH)
-
-    _launchctl(["unload", str(AGENT_PLIST_PATH)], ignore_errors=True)
-    _launchctl(["load", "-w", str(AGENT_PLIST_PATH)])
 
 
 def disable_autostart() -> None:

@@ -1,26 +1,23 @@
-#if canImport(XCTest)
-import XCTest
+import Testing
 import AppKit
 @testable import WallpaperControlApp
 
-final class WindowUtilitiesTests: XCTestCase {
-    func testConfigureWindowForClientSideDecoration() {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
+@MainActor
+@Test func configureWindowForClientSideDecoration() {
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+        styleMask: [.titled, .closable, .resizable, .miniaturizable],
+        backing: .buffered,
+        defer: false
+    )
 
-        configureWindowForClientDecorations(window)
+    configureWindowForClientDecorations(window)
 
-        XCTAssertEqual(window.titleVisibility, .hidden)
-        XCTAssertTrue(window.styleMask.contains(.fullSizeContentView))
-        XCTAssertFalse(window.isOpaque)
-        XCTAssertEqual(window.backgroundColor, .clear)
-        XCTAssertTrue(window.standardWindowButton(.closeButton)?.isHidden ?? false)
-        XCTAssertTrue(window.standardWindowButton(.miniaturizeButton)?.isHidden ?? false)
-        XCTAssertTrue(window.standardWindowButton(.zoomButton)?.isHidden ?? false)
-    }
+    #expect(window.titleVisibility == .hidden)
+    #expect(window.styleMask.contains(.fullSizeContentView))
+    #expect(window.isOpaque == false)
+    #expect(window.backgroundColor == .clear)
+    #expect(window.standardWindowButton(.closeButton)?.isHidden ?? false)
+    #expect(window.standardWindowButton(.miniaturizeButton)?.isHidden ?? false)
+    #expect(window.standardWindowButton(.zoomButton)?.isHidden ?? false)
 }
-#endif

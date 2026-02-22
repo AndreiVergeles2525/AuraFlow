@@ -60,17 +60,9 @@ class DaemonManagerTests(unittest.TestCase):
         agent_dir.mkdir()
         agent_path = agent_dir / "com.example.videowallpaper.plist"
         with mock.patch.object(daemon_manager, "AGENT_PLIST_PATH", agent_path):
-            with mock.patch("subprocess.run") as run:
-                run.side_effect = [
-                    mock.Mock(returncode=0, stderr="", stdout=""),
-                    mock.Mock(returncode=0, stderr="", stdout=""),
-                ]
-                daemon_manager.enable_autostart(config_path=self.config_path)
+            daemon_manager.enable_autostart(config_path=self.config_path)
 
         self.assertTrue(agent_path.exists())
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[0].args[0][0:2], ["launchctl", "unload"])
-        self.assertEqual(run.call_args_list[1].args[0][0:2], ["launchctl", "load"])
 
 
 if __name__ == "__main__":

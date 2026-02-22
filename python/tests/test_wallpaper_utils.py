@@ -31,6 +31,91 @@ class WallpaperUtilsTests(unittest.TestCase):
         set_wallpaper.assert_called_once_with(temp_path)
         self.assertEqual(result, temp_path)
 
+    def test_save_wallpaper_backup_skips_auraflow_last_frame(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            backup_path = temp_root / "wallpaper_backup.json"
+            last_frame_path = temp_root / "last_frame.png"
+            last_frame_path.write_bytes(b"frame")
+
+            with mock.patch.object(wallpaper_utils, "WALLPAPER_BACKUP_PATH", backup_path):
+                with mock.patch.object(wallpaper_utils, "LAST_FRAME_PATH", last_frame_path):
+                    with mock.patch.object(wallpaper_utils, "ensure_app_support_dir"):
+                        with mock.patch.object(
+                            wallpaper_utils,
+                            "_current_wallpapers",
+                            return_value={"1": str(last_frame_path)},
+                        ):
+                            wallpaper_utils._save_wallpaper_backup_if_needed()
+
+            self.assertFalse(backup_path.exists())
+
+    def test_restore_wallpaper_backup_falls_back_to_system_image(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            desktop_pictures = temp_root / "Desktop Pictures"
+            desktop_pictures.mkdir(parents=True)
+            fallback_image = desktop_pictures / "Default.heic"
+            fallback_image.write_bytes(b"image")
+
+            fake_screen = object()
+            fake_workspace = mock.Mock()
+
+            fake_appkit = mock.Mock()
+            fake_appkit.NSWorkspace.sharedWorkspace.return_value = fake_workspace
+            fake_appkit.NSScreen.screens.return_value = [fake_screen]
+
+            fake_nsurl = mock.Mock()
+            fake_nsurl.fileURLWithPath_.side_effect = lambda path: path
+
+            with mock.patch.object(wallpaper_utils, "_require_macos_frameworks"):
+                with mock.patch.object(wallpaper_utils, "_load_wallpaper_backup", return_value={}):
+                    with mock.patch.object(wallpaper_utils, "_screen_identifier", return_value="1"):
+                        with mock.patch.object(wallpaper_utils, "AppKit", fake_appkit):
+                            with mock.patch.object(wallpaper_utils, "NSURL", fake_nsurl):
+                                with mock.patch.object(
+                                    wallpaper_utils,
+                                    "_fallback_system_wallpaper",
+                                    return_value={"1": str(fallback_image)},
+                                ):
+                                    restored = wallpaper_utils.restore_wallpaper_backup()
+
+            self.assertTrue(restored)
+            fake_workspace.setDesktopImageURL_forScreen_options_error_.assert_called_once()
+
+    def test_restore_wallpaper_backup_does_not_delete_backup_by_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            backup_path = temp_root / "wallpaper_backup.json"
+            image_path = temp_root / "wallpaper.heic"
+            image_path.write_bytes(b"image")
+            backup_path.write_text("{}", encoding="utf-8")
+
+            fake_screen = object()
+            fake_workspace = mock.Mock()
+
+            fake_appkit = mock.Mock()
+            fake_appkit.NSWorkspace.sharedWorkspace.return_value = fake_workspace
+            fake_appkit.NSScreen.screens.return_value = [fake_screen]
+
+            fake_nsurl = mock.Mock()
+            fake_nsurl.fileURLWithPath_.side_effect = lambda path: path
+
+            with mock.patch.object(wallpaper_utils, "WALLPAPER_BACKUP_PATH", backup_path):
+                with mock.patch.object(wallpaper_utils, "_require_macos_frameworks"):
+                    with mock.patch.object(
+                        wallpaper_utils,
+                        "_load_wallpaper_backup",
+                        return_value={"1": str(image_path)},
+                    ):
+                        with mock.patch.object(wallpaper_utils, "_screen_identifier", return_value="1"):
+                            with mock.patch.object(wallpaper_utils, "AppKit", fake_appkit):
+                                with mock.patch.object(wallpaper_utils, "NSURL", fake_nsurl):
+                                    restored = wallpaper_utils.restore_wallpaper_backup()
+
+            self.assertTrue(restored)
+            self.assertTrue(backup_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
