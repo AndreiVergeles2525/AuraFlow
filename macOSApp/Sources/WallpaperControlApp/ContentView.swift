@@ -7,69 +7,79 @@ import QuartzCore
 struct ContentView: View {
     @StateObject var viewModel: AppViewModel
     @State private var isAdjustingSpeed: Bool = false
-    @State private var window: NSWindow?
     @State private var controlsVisible: Bool = true
     @State private var hideWorkItem: DispatchWorkItem?
     @State private var localMonitor: Any?
     @State private var globalMonitor: Any?
-    @Environment(\.colorScheme) private var colorScheme
 
     private var aspectRatio: CGFloat { mainScreenAspectRatio() }
     private let hideDelay: TimeInterval = 4.0
 
     var body: some View {
-        ZStack(alignment: .bottomLeading) {
-            PreviewLayer(player: viewModel.previewPlayer, aspectRatio: aspectRatio)
-                .ignoresSafeArea()
+        GeometryReader { proxy in
+            let horizontalPadding: CGFloat = 24
+            let maxPanelWidth: CGFloat = viewModel.isCatalogOpen ? 1040 : 920
+            let panelWidth = max(560, min(proxy.size.width - (horizontalPadding * 2), maxPanelWidth))
 
-            VStack(alignment: .leading, spacing: 12) {
-                if let alert = viewModel.alertMessage {
-                    ErrorBanner(text: alert)
-                        .padding(.leading, 20)
-                        .padding(.bottom, 12)
-                }
+            ZStack(alignment: .bottom) {
+                PreviewLayer(
+                    player: viewModel.previewPlayer,
+                    aspectRatio: aspectRatio,
+                    scaleMode: viewModel.scaleMode
+                )
+                    .ignoresSafeArea()
 
-                if viewModel.isCatalogOpen {
-                    WallpaperCatalogView(viewModel: viewModel)
-                } else {
-                    ControlPanel(
-                        viewModel: viewModel,
-                        isAdjustingSpeed: $isAdjustingSpeed
-                    )
-                    .disabled(!viewModel.isControllerAvailable)
-                    .overlay(
-                        Group {
-                            if !viewModel.isControllerAvailable {
-                                DisabledOverlay()
+                VStack(alignment: .leading, spacing: 12) {
+                    if let alert = viewModel.alertMessage {
+                        ErrorBanner(text: alert)
+                            .padding(.leading, 20)
+                            .padding(.bottom, 12)
+                    }
+
+                    if viewModel.isCatalogOpen {
+                        WallpaperCatalogView(viewModel: viewModel)
+                    } else {
+                        ControlPanel(
+                            viewModel: viewModel,
+                            isAdjustingSpeed: $isAdjustingSpeed
+                        )
+                        .disabled(!viewModel.isControllerAvailable)
+                        .overlay(
+                            Group {
+                                if !viewModel.isControllerAvailable {
+                                    DisabledOverlay()
+                                }
                             }
-                        }
-                    )
+                        )
+                    }
                 }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 24)
-            .padding(.bottom, 24)
-            .opacity(controlsVisible ? 1 : 0)
-            .animation(.easeInOut(duration: 0.3), value: controlsVisible)
-
-            WindowControls(window: $window)
-                .padding(.top, 18)
-                .padding(.leading, 24)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .frame(width: panelWidth, alignment: .leading)
+                .padding(.horizontal, horizontalPadding)
+                .padding(.bottom, 24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .opacity(controlsVisible ? 1 : 0)
                 .animation(.easeInOut(duration: 0.3), value: controlsVisible)
 
-            if !viewModel.isCatalogOpen {
-                SpeedOverlay(viewModel: viewModel, isAdjustingSpeed: $isAdjustingSpeed)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                    .padding(.top, 18)
-                    .opacity(controlsVisible ? 1 : 0)
-                    .animation(.easeInOut(duration: 0.3), value: controlsVisible)
+                if !viewModel.isCatalogOpen {
+                    SpeedOverlay(viewModel: viewModel, isAdjustingSpeed: $isAdjustingSpeed)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .padding(.top, 18)
+                        .opacity(controlsVisible ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.3), value: controlsVisible)
+                }
+
+                if viewModel.isSettingsOpen {
+                    SettingsPopupOverlay(viewModel: viewModel)
+                }
+
+                if viewModel.isMonitoringOpen {
+                    MonitoringPopupOverlay(viewModel: viewModel)
+                }
             }
         }
         .frame(minWidth: 760, minHeight: 480)
         .background(Color.clear)
-        .overlay(WindowAccessor(window: $window).allowsHitTesting(false))
+        .overlay(WindowAccessor().allowsHitTesting(false))
         .task {
             await viewModel.loadStatus()
         }
@@ -86,9 +96,10 @@ struct ContentView: View {
 struct PreviewLayer: View {
     let player: AVPlayer?
     let aspectRatio: CGFloat
+    let scaleMode: WallpaperScaleMode
 
     var body: some View {
-        VideoPreview(player: player)
+        VideoPreview(player: player, videoGravity: scaleMode.previewGravity)
             .aspectRatio(aspectRatio, contentMode: .fill)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
@@ -102,44 +113,58 @@ struct ControlPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .center, spacing: 16) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Video")
-                        .font(.headline.weight(.semibold))
-                    Text(viewModel.selectedVideoName)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Spacer()
-                Button("Wallpaper Catalog") {
-                    viewModel.openCatalog()
-                }
-                .buttonStyle(.bordered)
-                .disabled(!viewModel.canClearWallpaper)
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center, spacing: 16) {
+                    videoInfo
+                    Spacer(minLength: 0)
+                    Button("Wallpaper Catalog") {
+                        viewModel.openCatalog()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!viewModel.canClearWallpaper)
 
-                Button("Change Wallpaper…") {
-                    viewModel.chooseVideo()
+                    Button("Change Wallpaper…") {
+                        viewModel.chooseVideo()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!viewModel.canClearWallpaper)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(!viewModel.canClearWallpaper)
+                VStack(alignment: .leading, spacing: 10) {
+                    videoInfo
+                    HStack(spacing: 10) {
+                        Button("Wallpaper Catalog") {
+                            viewModel.openCatalog()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!viewModel.canClearWallpaper)
+
+                        Button("Change Wallpaper…") {
+                            viewModel.chooseVideo()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!viewModel.canClearWallpaper)
+                    }
+                }
             }
 
             ControlButtons(viewModel: viewModel)
 
             HStack(alignment: .center, spacing: 12) {
-                Toggle(isOn: Binding(
-                    get: { viewModel.autostartEnabled },
-                    set: { newValue in viewModel.toggleAutostart(newValue) }
-                )) {
-                    Label("Launch at Login", systemImage: "power")
-                        .labelStyle(.titleAndIcon)
+                Button {
+                    viewModel.openSettings()
+                } label: {
+                    Label("Settings", systemImage: "slider.horizontal.3.circle.fill")
                 }
-                .toggleStyle(.switch)
-                .disabled(!viewModel.canToggleAutostart)
+                .buttonStyle(.bordered)
+                .disabled(viewModel.isBusy)
 
-                Spacer()
+                Button {
+                    viewModel.openMonitoring()
+                } label: {
+                    Label("Monitoring", systemImage: "gauge.with.dots.needle.67percent")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!viewModel.canOpenMonitoring)
 
                 if let message = viewModel.statusMessage {
                     Text(message)
@@ -147,10 +172,22 @@ struct ControlPanel: View {
                         .font(.caption)
                 }
             }
+
+            if viewModel.optimizationInProgress {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let label = viewModel.optimizationLabel {
+                        Text(label)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    ProgressView(value: viewModel.optimizationProgress)
+                        .progressViewStyle(.linear)
+                }
+            }
         }
         .padding(.vertical, 14)
         .padding(.horizontal, 22)
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             LiquidGlassView()
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -162,44 +199,388 @@ struct ControlPanel: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.35 : 0.25), radius: 16, x: 0, y: 10)
     }
+
+    private var videoInfo: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Video")
+                .font(.headline.weight(.semibold))
+            Text(viewModel.selectedVideoName)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+}
+
+struct SettingsPopupOverlay: View {
+    @ObservedObject var viewModel: AppViewModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(colorScheme == .dark ? 0.42 : 0.28)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    viewModel.closeSettings()
+                }
+
+            SettingsPopupCard(viewModel: viewModel)
+                .frame(maxWidth: 620)
+                .padding(.horizontal, 24)
+                .transition(.asymmetric(insertion: .scale(scale: 0.94).combined(with: .opacity), removal: .opacity))
+        }
+        .animation(.spring(response: 0.3, dampingFraction: 0.86), value: viewModel.isSettingsOpen)
+        .zIndex(50)
+    }
+}
+
+struct SettingsPopupCard: View {
+    @ObservedObject var viewModel: AppViewModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Playback Settings", systemImage: "gearshape.2.fill")
+                    .font(.headline.weight(.semibold))
+                Spacer()
+                Button {
+                    viewModel.closeSettings()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Divider()
+
+            Toggle(isOn: Binding(
+                get: { viewModel.autostartEnabled },
+                set: { newValue in viewModel.toggleAutostart(newValue) }
+            )) {
+                Label("Launch at Login", systemImage: "power")
+            }
+            .toggleStyle(.switch)
+            .disabled(!viewModel.canToggleAutostart)
+
+            Toggle(isOn: Binding(
+                get: { viewModel.pauseOnFullscreenEnabled },
+                set: { newValue in viewModel.togglePauseOnFullscreen(newValue) }
+            )) {
+                Label("Auto-Pause on Fullscreen Apps", systemImage: "display")
+            }
+            .toggleStyle(.switch)
+            .disabled(!viewModel.canTogglePauseOnFullscreen)
+
+            Toggle(isOn: Binding(
+                get: { viewModel.blendInterpolationEnabled },
+                set: { newValue in viewModel.toggleBlendInterpolation(newValue) }
+            )) {
+                Label("Blend Interpolation", systemImage: "sparkles.tv")
+            }
+            .toggleStyle(.switch)
+            .disabled(!viewModel.canToggleBlendInterpolation)
+
+            Picker(
+                "Scale Algorithm",
+                selection: Binding(
+                    get: { viewModel.scaleMode },
+                    set: { viewModel.setScaleMode($0) }
+                )
+            ) {
+                ForEach(WallpaperScaleMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!viewModel.canToggleScaleMode)
+
+            Divider().padding(.vertical, 4)
+
+            Text("Video Optimization")
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(.secondary)
+
+            Toggle(isOn: Binding(
+                get: { viewModel.optimizationEnabled },
+                set: { viewModel.setOptimizationEnabled($0) }
+            )) {
+                Text("Enable Auto Optimization")
+            }
+            .toggleStyle(.switch)
+            .disabled(!viewModel.canChangeOptimizationSettings)
+
+            HStack(spacing: 12) {
+                Toggle(isOn: Binding(
+                    get: { viewModel.optimizationTranscodeH264ToHEVC },
+                    set: { viewModel.setOptimizationTranscodeH264ToHEVC($0) }
+                )) {
+                    Text("H.264 → HEVC")
+                }
+                .toggleStyle(.checkbox)
+                .disabled(!viewModel.optimizationEnabled || !viewModel.canChangeOptimizationSettings)
+
+                Toggle(isOn: Binding(
+                    get: { viewModel.optimizationAllowAV1Passthrough },
+                    set: { viewModel.setOptimizationAllowAV1Passthrough($0) }
+                )) {
+                    Text("Keep AV1 (HW Decode)")
+                }
+                .toggleStyle(.checkbox)
+                .disabled(!viewModel.optimizationEnabled || !viewModel.canChangeOptimizationSettings)
+            }
+
+            Toggle(isOn: Binding(
+                get: { viewModel.optimizationForceSoftwareAV1Encode },
+                set: { viewModel.setOptimizationForceSoftwareAV1Encode($0) }
+            )) {
+                Text("Force AV1 Encode (Software)")
+            }
+            .toggleStyle(.checkbox)
+            .disabled(
+                !viewModel.optimizationEnabled
+                    || !viewModel.canChangeOptimizationSettings
+                    || !viewModel.optimizationHardwareAV1DecodeAvailable
+            )
+
+            Picker(
+                "Optimization Profile",
+                selection: Binding(
+                    get: { viewModel.optimizationProfile },
+                    set: { viewModel.setOptimizationProfile($0) }
+                )
+            ) {
+                ForEach(OptimizationProfile.allCases) { profile in
+                    Text(profile.title).tag(profile)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!viewModel.optimizationEnabled || !viewModel.canChangeOptimizationSettings)
+
+            if viewModel.optimizationHardwareAV1DecodeAvailable {
+                Text("AV1 hardware encode is unavailable on Mac. Force AV1 uses software ffmpeg and can be CPU intensive.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            } else {
+                Text("Force AV1 encode is disabled because this Mac has no hardware AV1 decode.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
+            if viewModel.optimizationInProgress {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let label = viewModel.optimizationLabel {
+                        Text(label)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    ProgressView(value: viewModel.optimizationProgress)
+                        .progressViewStyle(.linear)
+                }
+                .padding(.top, 4)
+            }
+        }
+        .padding(.vertical, 16)
+        .padding(.horizontal, 20)
+        .background(
+            LiquidGlassView()
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.white.opacity(colorScheme == .dark ? 0.14 : 0.2), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.45 : 0.28), radius: 24, x: 0, y: 16)
+    }
+}
+
+struct MonitoringPopupOverlay: View {
+    @ObservedObject var viewModel: AppViewModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(colorScheme == .dark ? 0.42 : 0.28)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    viewModel.closeMonitoring()
+                }
+
+            MonitoringPopupCard(viewModel: viewModel)
+                .frame(maxWidth: 620)
+                .padding(.horizontal, 24)
+                .transition(.asymmetric(insertion: .scale(scale: 0.94).combined(with: .opacity), removal: .opacity))
+        }
+        .animation(.spring(response: 0.3, dampingFraction: 0.86), value: viewModel.isMonitoringOpen)
+        .zIndex(60)
+    }
+}
+
+struct MonitoringPopupCard: View {
+    @ObservedObject var viewModel: AppViewModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Wallpaper Monitoring", systemImage: "chart.bar.xaxis")
+                    .font(.headline.weight(.semibold))
+                Spacer()
+                Button {
+                    viewModel.closeMonitoring()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Divider()
+
+            if let metrics = viewModel.monitoringSnapshot {
+                let cpu = metrics.cpu_percent ?? 0
+                let memory = metrics.memory_mb ?? 0
+                let threads = metrics.thread_count ?? 0
+                let processCount = metrics.process_count ?? metrics.daemon_pids?.count ?? (metrics.pid == nil ? 0 : 1)
+                let screens = metrics.health?.screens ?? 0
+                let windows = metrics.health?.windows ?? 0
+                let rate = metrics.health?.player_rate ?? 0
+
+                MonitoringRow(label: "Daemon PID", value: metrics.pid.map(String.init) ?? "n/a")
+                MonitoringRow(label: "Daemon Processes", value: "\(processCount)")
+                MonitoringRow(label: "Running", value: metrics.running ? "Yes" : "No")
+                MonitoringRow(label: "CPU", value: String(format: "%.1f%%", cpu))
+                MonitoringRow(label: "Memory", value: String(format: "%.1f MB", memory))
+                MonitoringRow(label: "Threads", value: "\(threads)")
+                MonitoringRow(label: "Screens/Windows", value: "\(screens)/\(windows)")
+                MonitoringRow(label: "Player Rate", value: String(format: "%.2fx", rate))
+
+                if let pids = metrics.daemon_pids, !pids.isEmpty {
+                    let rendered = pids.prefix(4).map(String.init).joined(separator: ", ")
+                    let suffix = pids.count > 4 ? ", ..." : ""
+                    Text("PIDs: \(rendered)\(suffix)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+
+                if let reason = metrics.health?.reason, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text("Health: \(reason)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .padding(.top, 4)
+                }
+            } else {
+                Text("Collecting daemon metrics...")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            if let error = viewModel.monitoringErrorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
+
+            HStack {
+                Button {
+                    viewModel.refreshMonitoring()
+                } label: {
+                    if viewModel.isMonitoringRefreshing {
+                        Label("Refreshing…", systemImage: "arrow.clockwise")
+                    } else {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.isMonitoringRefreshing)
+                Spacer()
+            }
+        }
+        .padding(.vertical, 16)
+        .padding(.horizontal, 20)
+        .background(
+            LiquidGlassView()
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.white.opacity(colorScheme == .dark ? 0.14 : 0.2), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.45 : 0.28), radius: 24, x: 0, y: 16)
+    }
+}
+
+struct MonitoringRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Spacer()
+            Text(value)
+                .font(.caption.weight(.semibold))
+                .monospacedDigit()
+        }
+    }
 }
 
 struct ControlButtons: View {
     @ObservedObject var viewModel: AppViewModel
 
     var body: some View {
-        HStack(spacing: 18) {
-            Spacer()
-
-            Button {
-                viewModel.start()
-            } label: {
-                Label("Start", systemImage: "desktopcomputer")
-                    .frame(minWidth: 96)
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                startButton
+                stopButton
+                clearButton
+                Spacer(minLength: 0)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!viewModel.canStart)
-
-            Button(role: .destructive) {
-                viewModel.stop()
-            } label: {
-                Label("Stop", systemImage: "stop.circle")
-                    .frame(minWidth: 96)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    startButton
+                    stopButton
+                }
+                clearButton
             }
-            .buttonStyle(.bordered)
-            .disabled(!viewModel.canStop)
-
-            Button(role: .destructive) {
-                viewModel.clearWallpaper()
-            } label: {
-                Label("Remove Wallpaper", systemImage: "photo.slash")
-                    .frame(minWidth: 140)
-            }
-            .buttonStyle(.bordered)
-            .disabled(!viewModel.canClearWallpaper)
-
-            Spacer()
         }
+    }
+
+    private var startButton: some View {
+        Button {
+            viewModel.start()
+        } label: {
+            Label("Start", systemImage: "desktopcomputer")
+                .frame(minWidth: 96)
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(!viewModel.canStart)
+    }
+
+    private var stopButton: some View {
+        Button(role: .destructive) {
+            viewModel.stop()
+        } label: {
+            Label("Stop", systemImage: "stop.circle")
+                .frame(minWidth: 96)
+        }
+        .buttonStyle(.bordered)
+        .disabled(!viewModel.canStop)
+    }
+
+    private var clearButton: some View {
+        Button(role: .destructive) {
+            viewModel.clearWallpaper()
+        } label: {
+            Label("Remove Wallpaper", systemImage: "photo.slash")
+                .frame(minWidth: 140)
+        }
+        .buttonStyle(.bordered)
+        .disabled(!viewModel.canClearWallpaper)
     }
 }
 
@@ -207,15 +588,23 @@ struct WallpaperCatalogView: View {
     @ObservedObject var viewModel: AppViewModel
     @Environment(\.colorScheme) private var colorScheme
 
+    private var isDetailOpened: Bool {
+        viewModel.selectedCatalogWallpaper != nil
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 Button {
                     viewModel.navigateBackFromCatalog()
                 } label: {
-                    Label("Back", systemImage: "chevron.left")
+                    Label(
+                        isDetailOpened ? "Back" : "Close",
+                        systemImage: isDetailOpened ? "chevron.left" : "xmark"
+                    )
                 }
                 .buttonStyle(.bordered)
+                .keyboardShortcut(.escape, modifiers: [])
 
                 Text(viewModel.selectedCatalogWallpaper?.title ?? "Wallpaper Catalog")
                     .font(.headline.weight(.semibold))
@@ -386,7 +775,7 @@ struct SpeedOverlay: View {
             Slider(
                 value: Binding(
                     get: { viewModel.playbackSpeed },
-                    set: { newValue in viewModel.playbackSpeed = newValue }
+                    set: { newValue in viewModel.setPreviewPlaybackSpeed(newValue) }
                 ),
                 in: 0.25...2.0,
                 step: 0.05,
@@ -418,11 +807,12 @@ struct SpeedOverlay: View {
 
 struct VideoPreview: NSViewRepresentable {
     let player: AVPlayer?
+    let videoGravity: AVLayerVideoGravity
 
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.controlsStyle = .none
-        view.videoGravity = .resizeAspectFill
+        view.videoGravity = videoGravity
         view.allowsPictureInPicturePlayback = false
         view.updatesNowPlayingInfoCenter = false
         view.showsFullScreenToggleButton = false
@@ -433,6 +823,7 @@ struct VideoPreview: NSViewRepresentable {
 
     func updateNSView(_ nsView: AVPlayerView, context: Context) {
         nsView.player = player
+        nsView.videoGravity = videoGravity
     }
 }
 
@@ -454,37 +845,6 @@ struct VisualEffectView: NSViewRepresentable {
         nsView.material = material
         nsView.blendingMode = blendingMode
         nsView.state = state
-    }
-}
-
-struct WindowControls: View {
-    @Binding var window: NSWindow?
-
-    var body: some View {
-        HStack(spacing: 9) {
-            WindowControlButton(color: Color(red: 1, green: 0.33, blue: 0.31)) {
-                window?.orderOut(nil)
-            }
-            WindowControlButton(color: Color(red: 1, green: 0.80, blue: 0.25)) {
-                window?.miniaturize(nil)
-            }
-            WindowControlButton(color: Color(red: 0.26, green: 0.86, blue: 0.39)) {
-                window?.zoom(nil)
-            }
-        }
-    }
-}
-
-struct WindowControlButton: View {
-    let color: Color
-    let action: () -> Void
-
-    var body: some View {
-        Circle()
-            .fill(color)
-            .frame(width: 13, height: 13)
-            .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 0.6))
-            .onTapGesture { action() }
     }
 }
 
@@ -526,14 +886,11 @@ struct ErrorBanner: View {
 }
 
 struct WindowAccessor: NSViewRepresentable {
-    @Binding var window: NSWindow?
-
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async {
             if let currentWindow = view.window {
                 configureWindowForClientDecorations(currentWindow)
-                window = currentWindow
             }
         }
         return view
@@ -543,9 +900,6 @@ struct WindowAccessor: NSViewRepresentable {
         DispatchQueue.main.async {
             if let currentWindow = nsView.window {
                 configureWindowForClientDecorations(currentWindow)
-                if window !== currentWindow {
-                    window = currentWindow
-                }
             }
         }
     }

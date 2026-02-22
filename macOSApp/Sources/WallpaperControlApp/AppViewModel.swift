@@ -10,15 +10,93 @@ struct ControlConfig: Codable {
     var playback_speed: Double
     var volume: Double?
     var autostart: Bool?
+    var blend_interpolation: Bool? = nil
+    var pause_on_fullscreen: Bool? = nil
+    var scale_mode: String? = nil
 }
 
 struct ControlStatus: Codable {
+    var contract_version: Int? = nil
     var running: Bool
     var config: ControlConfig
     var pid: Int?
     var autostart: Bool?
     var paused: Bool? = nil
     var wallpaper_restored: Bool? = nil
+    var wallpaper: String? = nil
+    var health: DaemonHealth? = nil
+}
+
+struct DaemonHealth: Codable {
+    var contract_version: Int? = nil
+    var available: Bool? = nil
+    var fresh: Bool? = nil
+    var suspicious: Bool? = nil
+    var reason: String? = nil
+    var updated_at: Double? = nil
+    var lag_seconds: Double? = nil
+    var screens: Int? = nil
+    var windows: Int? = nil
+    var player_rate: Double? = nil
+    var stall_events: Int? = nil
+    var recovery_events: Int? = nil
+    var consecutive_stall_polls: Int? = nil
+    var paused: Bool? = nil
+    var manual_paused: Bool? = nil
+    var low_power_mode: Bool? = nil
+    var auto_paused_for_low_power: Bool? = nil
+    var pause_on_fullscreen: Bool? = nil
+    var fullscreen_app_detected: Bool? = nil
+    var auto_paused_for_fullscreen: Bool? = nil
+    var blend_interpolation_enabled: Bool? = nil
+    var blend_interpolation_active: Bool? = nil
+    var scale_mode: String? = nil
+}
+
+enum WallpaperScaleMode: String, Codable, CaseIterable, Identifiable {
+    case fill
+    case fit
+    case stretch
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .fill:
+            return "Fill"
+        case .fit:
+            return "Fit"
+        case .stretch:
+            return "Stretch"
+        }
+    }
+
+    var commandValue: String { rawValue }
+
+    var previewGravity: AVLayerVideoGravity {
+        switch self {
+        case .fill:
+            return .resizeAspectFill
+        case .fit:
+            return .resizeAspect
+        case .stretch:
+            return .resize
+        }
+    }
+}
+
+struct DaemonMetrics: Codable {
+    var contract_version: Int? = nil
+    var updated_at: Double? = nil
+    var running: Bool
+    var paused: Bool? = nil
+    var pid: Int? = nil
+    var daemon_pids: [Int]? = nil
+    var process_count: Int? = nil
+    var cpu_percent: Double? = nil
+    var memory_mb: Double? = nil
+    var thread_count: Int? = nil
+    var health: DaemonHealth? = nil
 }
 
 struct CatalogVideoSource: Hashable {
@@ -124,7 +202,11 @@ protocol PythonControlling {
     func clearWallpaper() throws -> ControlStatus
     func setVideo(_ url: URL) throws -> ControlStatus
     func setSpeed(_ speed: Double) throws -> ControlStatus
+    func setInterpolation(_ enabled: Bool) throws -> ControlStatus
+    func setPauseOnFullscreen(_ enabled: Bool) throws -> ControlStatus
+    func setScaleMode(_ mode: WallpaperScaleMode) throws -> ControlStatus
     func setAutostart(_ enabled: Bool) throws -> ControlStatus
+    func metrics() throws -> DaemonMetrics
 }
 
 enum PythonControllerError: LocalizedError {
@@ -154,6 +236,16 @@ final class PythonController: PythonControlling {
             let output = try bridge.runCommand(command, arguments: arguments)
             let data = Data(output.utf8)
             return try JSONDecoder().decode(ControlStatus.self, from: data)
+        } catch {
+            throw PythonControllerError.unavailable(error.localizedDescription)
+        }
+    }
+
+    private func runMetrics(command: String, arguments: [String] = []) throws -> DaemonMetrics {
+        do {
+            let output = try bridge.runCommand(command, arguments: arguments)
+            let data = Data(output.utf8)
+            return try JSONDecoder().decode(DaemonMetrics.self, from: data)
         } catch {
             throw PythonControllerError.unavailable(error.localizedDescription)
         }
@@ -190,9 +282,27 @@ final class PythonController: PythonControlling {
         try run(command: "set-speed", arguments: [String(speed)])
     }
 
+    func setInterpolation(_ enabled: Bool) throws -> ControlStatus {
+        let state = enabled ? "on" : "off"
+        return try run(command: "set-interpolation", arguments: [state])
+    }
+
+    func setPauseOnFullscreen(_ enabled: Bool) throws -> ControlStatus {
+        let state = enabled ? "on" : "off"
+        return try run(command: "set-fullscreen-pause", arguments: [state])
+    }
+
+    func setScaleMode(_ mode: WallpaperScaleMode) throws -> ControlStatus {
+        try run(command: "set-scale", arguments: [mode.commandValue])
+    }
+
     func setAutostart(_ enabled: Bool) throws -> ControlStatus {
         let state = enabled ? "on" : "off"
         return try run(command: "set-autostart", arguments: [state])
+    }
+
+    func metrics() throws -> DaemonMetrics {
+        try runMetrics(command: "metrics")
     }
 }
 
@@ -202,6 +312,23 @@ final class AppViewModel: ObservableObject {
     @Published var playbackSpeed: Double = 1.0
     @Published var isRunning: Bool = false
     @Published var autostartEnabled: Bool = false
+    @Published var blendInterpolationEnabled: Bool = false
+    @Published var pauseOnFullscreenEnabled: Bool = true
+    @Published var scaleMode: WallpaperScaleMode = .fill
+    @Published var isSettingsOpen: Bool = false
+    @Published var isMonitoringOpen: Bool = false
+    @Published var monitoringSnapshot: DaemonMetrics?
+    @Published var monitoringErrorMessage: String?
+    @Published var isMonitoringRefreshing: Bool = false
+    @Published var optimizationEnabled: Bool = true
+    @Published var optimizationAllowAV1Passthrough: Bool = true
+    @Published var optimizationTranscodeH264ToHEVC: Bool = true
+    @Published var optimizationForceSoftwareAV1Encode: Bool = false
+    @Published private(set) var optimizationHardwareAV1DecodeAvailable: Bool = false
+    @Published var optimizationProfile: OptimizationProfile = .balanced
+    @Published var optimizationInProgress: Bool = false
+    @Published var optimizationProgress: Double = 0.0
+    @Published var optimizationLabel: String?
     @Published var isBusy: Bool = false
     @Published var statusMessage: String?
     @Published var alertMessage: String?
@@ -214,10 +341,23 @@ final class AppViewModel: ObservableObject {
     let catalogWallpapers: [CatalogWallpaper] = CatalogWallpaper.defaultCatalog
 
     private let controller: PythonControlling?
+    private let optimizer = VideoOptimizer()
+    private let optimizationStore: VideoOptimizationStore
     private var previewEndObserver: NSObjectProtocol?
     private var didAttemptAutostartOnLaunch = false
     private var healthMonitorTask: Task<Void, Never>?
     private var isHealthCheckInProgress = false
+    private var bridgeFailureCount = 0
+    private var daemonSuspiciousPolls = 0
+    private var lowPowerAutoPauseActive = false
+    private var fullscreenAutoPauseActive = false
+    private var monitoringTask: Task<Void, Never>?
+    private var terminationObserver: NSObjectProtocol?
+    private var isShuttingDown = false
+
+    private let expectedStatusContractVersion = 2
+    private let bridgeFailureThreshold = 3
+    private let daemonSuspiciousThreshold = 2
 
     var isControllerAvailable: Bool {
         controller != nil
@@ -243,6 +383,26 @@ final class AppViewModel: ObservableObject {
         isControllerAvailable && !isBusy
     }
 
+    var canToggleBlendInterpolation: Bool {
+        isControllerAvailable && !isBusy
+    }
+
+    var canTogglePauseOnFullscreen: Bool {
+        isControllerAvailable && !isBusy
+    }
+
+    var canToggleScaleMode: Bool {
+        isControllerAvailable && !isBusy
+    }
+
+    var canOpenMonitoring: Bool {
+        isControllerAvailable
+    }
+
+    var canChangeOptimizationSettings: Bool {
+        !isBusy && !optimizationInProgress
+    }
+
     var canApplyCatalogWallpaper: Bool {
         isControllerAvailable && !isBusy && catalogDownloadID == nil
     }
@@ -256,7 +416,11 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    init(controller: PythonControlling? = nil) {
+    init(
+        controller: PythonControlling? = nil,
+        optimizationStore: VideoOptimizationStore = VideoOptimizationStore()
+    ) {
+        self.optimizationStore = optimizationStore
         if let controller {
             self.controller = controller
         } else {
@@ -267,11 +431,26 @@ final class AppViewModel: ObservableObject {
                 alertMessage = error.localizedDescription
             }
         }
+        optimizationHardwareAV1DecodeAvailable = optimizer.supportsHardwareAV1Decode()
+        applyOptimizationSettings(optimizationStore.load())
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.beginShutdown()
+            }
+        }
         startHealthMonitor()
     }
 
     deinit {
         healthMonitorTask?.cancel()
+        monitoringTask?.cancel()
+        if let terminationObserver {
+            NotificationCenter.default.removeObserver(terminationObserver)
+        }
         if let previewEndObserver {
             NotificationCenter.default.removeObserver(previewEndObserver)
         }
@@ -289,17 +468,18 @@ final class AppViewModel: ObservableObject {
         do {
             let status = try await runAsync { try controller.status() }
             apply(status: status)
+            recordBridgeSuccess()
             await startFromAutostartIfNeeded(using: status)
             alertMessage = nil
         } catch {
-            alertMessage = error.localizedDescription
+            recordBridgeFailure(error, context: "status")
         }
     }
 
     func chooseVideo(force: Bool = false) {
         guard force || !isBusy else { return }
         let panel = NSOpenPanel()
-        var types: [UTType] = [.mpeg4Movie, .quickTimeMovie]
+        var types: [UTType] = [.mpeg4Movie, .quickTimeMovie, .gif]
         if let m4v = UTType(filenameExtension: "m4v") {
             types.append(m4v)
         }
@@ -326,10 +506,16 @@ final class AppViewModel: ObservableObject {
     }
 
     func openCatalog() {
+        isSettingsOpen = false
+        closeMonitoring()
+        selectedCatalogWallpaper = nil
         isCatalogOpen = true
     }
 
     func openCatalogFromMenuBar() {
+        isSettingsOpen = false
+        closeMonitoring()
+        selectedCatalogWallpaper = nil
         isCatalogOpen = true
     }
 
@@ -342,6 +528,7 @@ final class AppViewModel: ObservableObject {
             selectedCatalogWallpaper = nil
             return
         }
+        selectedCatalogWallpaper = nil
         isCatalogOpen = false
     }
 
@@ -373,12 +560,20 @@ final class AppViewModel: ObservableObject {
         defer { isBusy = false }
 
         do {
-            let status = try await runAsync { try controller.setVideo(url) }
+            let prepared = try await prepareVideoURLForPlayback(url)
+            let status = try await runAsync { try controller.setVideo(prepared.url) }
             apply(status: status)
-            statusMessage = "Wallpaper source updated."
+            if let wallpaperPath = status.wallpaper {
+                _ = WallpaperDesktopSupport.applyToAllDesktops(imagePath: wallpaperPath)
+            }
+            recordBridgeSuccess()
+            statusMessage = prepared.summary ?? "Wallpaper source updated."
             alertMessage = nil
         } catch {
-            alertMessage = "Failed to set video: \(error.localizedDescription)"
+            recordBridgeFailure(error, context: "set-video")
+            if bridgeFailureCount < bridgeFailureThreshold {
+                alertMessage = "Failed to set video: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -398,10 +593,14 @@ final class AppViewModel: ObservableObject {
                     try controller.start(videoURL: nil, speed: nil)
                 }
                 apply(status: status)
+                recordBridgeSuccess()
                 statusMessage = "Wallpaper started."
                 alertMessage = nil
             } catch {
-                alertMessage = "Failed to start: \(error.localizedDescription)"
+                recordBridgeFailure(error, context: "start")
+                if bridgeFailureCount < bridgeFailureThreshold {
+                    alertMessage = "Failed to start: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -415,10 +614,14 @@ final class AppViewModel: ObservableObject {
             do {
                 let status = try await runAsync { try controller.stop() }
                 apply(status: status)
+                recordBridgeSuccess()
                 statusMessage = "Paused on current frame."
                 alertMessage = nil
             } catch {
-                alertMessage = "Failed to pause: \(error.localizedDescription)"
+                recordBridgeFailure(error, context: "pause")
+                if bridgeFailureCount < bridgeFailureThreshold {
+                    alertMessage = "Failed to pause: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -432,20 +635,26 @@ final class AppViewModel: ObservableObject {
             do {
                 let status = try await runAsync { try controller.clearWallpaper() }
                 apply(status: status)
-                if status.wallpaper_restored == false {
-                    statusMessage = "Wallpaper backup not found."
-                } else {
+                let swiftRestored = WallpaperDesktopSupport.restoreFromBackupFiles()
+                let restored = (status.wallpaper_restored ?? false) || swiftRestored
+                recordBridgeSuccess()
+                if restored {
                     statusMessage = "Original wallpaper restored."
+                } else {
+                    statusMessage = "Wallpaper backup not found."
                 }
                 alertMessage = nil
             } catch {
-                alertMessage = "Failed to restore wallpaper: \(error.localizedDescription)"
+                recordBridgeFailure(error, context: "clear-wallpaper")
+                if bridgeFailureCount < bridgeFailureThreshold {
+                    alertMessage = "Failed to restore wallpaper: \(error.localizedDescription)"
+                }
             }
         }
     }
 
     func updateSpeed(_ speed: Double) {
-        playbackSpeed = speed
+        setPreviewPlaybackSpeed(speed)
         guard let controller else { return }
         guard !isBusy else { return }
         Task {
@@ -454,12 +663,21 @@ final class AppViewModel: ObservableObject {
             do {
                 let status = try await runAsync { try controller.setSpeed(speed) }
                 apply(status: status)
+                recordBridgeSuccess()
                 statusMessage = "Speed updated."
                 alertMessage = nil
             } catch {
-                alertMessage = "Failed to update speed: \(error.localizedDescription)"
+                recordBridgeFailure(error, context: "set-speed")
+                if bridgeFailureCount < bridgeFailureThreshold {
+                    alertMessage = "Failed to update speed: \(error.localizedDescription)"
+                }
             }
         }
+    }
+
+    func setPreviewPlaybackSpeed(_ speed: Double) {
+        playbackSpeed = speed
+        syncPreviewPlaybackRate()
     }
 
     func toggleAutostart(_ enabled: Bool) {
@@ -482,34 +700,260 @@ final class AppViewModel: ObservableObject {
             do {
                 let status = try await runAsync { try controller.setAutostart(enabled) }
                 apply(status: status)
+                recordBridgeSuccess()
                 statusMessage = enabled ? "Launch at login enabled." : "Launch at login disabled."
                 alertMessage = nil
             } catch {
                 autostartEnabled = previous
-                alertMessage = "Failed to update launch at login: \(error.localizedDescription)"
+                recordBridgeFailure(error, context: "set-autostart")
+                if bridgeFailureCount < bridgeFailureThreshold {
+                    alertMessage = "Failed to update launch at login: \(error.localizedDescription)"
+                }
             }
         }
+    }
+
+    func toggleBlendInterpolation(_ enabled: Bool) {
+        guard !isBusy else {
+            blendInterpolationEnabled = !enabled
+            return
+        }
+
+        let previous = blendInterpolationEnabled
+        blendInterpolationEnabled = enabled
+        guard let controller else { return }
+        Task {
+            isBusy = true
+            defer { isBusy = false }
+            do {
+                let status = try await runAsync { try controller.setInterpolation(enabled) }
+                apply(status: status)
+                recordBridgeSuccess()
+                statusMessage = enabled
+                    ? "Blend interpolation enabled."
+                    : "Blend interpolation disabled."
+                alertMessage = nil
+            } catch {
+                blendInterpolationEnabled = previous
+                recordBridgeFailure(error, context: "set-interpolation")
+                if bridgeFailureCount < bridgeFailureThreshold {
+                    alertMessage = "Failed to update interpolation: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func togglePauseOnFullscreen(_ enabled: Bool) {
+        guard !isBusy else {
+            pauseOnFullscreenEnabled = !enabled
+            return
+        }
+
+        let previous = pauseOnFullscreenEnabled
+        pauseOnFullscreenEnabled = enabled
+        guard let controller else { return }
+        Task {
+            isBusy = true
+            defer { isBusy = false }
+            do {
+                let status = try await runAsync { try controller.setPauseOnFullscreen(enabled) }
+                apply(status: status)
+                recordBridgeSuccess()
+                statusMessage = enabled
+                    ? "Auto-pause on fullscreen enabled."
+                    : "Auto-pause on fullscreen disabled."
+                alertMessage = nil
+            } catch {
+                pauseOnFullscreenEnabled = previous
+                recordBridgeFailure(error, context: "set-fullscreen-pause")
+                if bridgeFailureCount < bridgeFailureThreshold {
+                    alertMessage = "Failed to update fullscreen policy: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func setScaleMode(_ mode: WallpaperScaleMode) {
+        guard !isBusy else { return }
+        let previous = scaleMode
+        scaleMode = mode
+        guard let controller else { return }
+        Task {
+            isBusy = true
+            defer { isBusy = false }
+            do {
+                let status = try await runAsync { try controller.setScaleMode(mode) }
+                apply(status: status)
+                recordBridgeSuccess()
+                statusMessage = "Scale mode: \(mode.title)."
+                alertMessage = nil
+            } catch {
+                scaleMode = previous
+                recordBridgeFailure(error, context: "set-scale")
+                if bridgeFailureCount < bridgeFailureThreshold {
+                    alertMessage = "Failed to update scale mode: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func refreshMonitoring() {
+        Task {
+            await refreshMonitoringSnapshot(surfaceErrors: true)
+        }
+    }
+
+    func openSettings() {
+        closeMonitoring()
+        isSettingsOpen = true
+    }
+
+    func closeSettings() {
+        isSettingsOpen = false
+    }
+
+    func openMonitoring() {
+        closeSettings()
+        isMonitoringOpen = true
+        monitoringErrorMessage = nil
+        startMonitoringLoop()
+    }
+
+    func closeMonitoring() {
+        isMonitoringOpen = false
+        monitoringTask?.cancel()
+        monitoringTask = nil
+    }
+
+    func setOptimizationEnabled(_ enabled: Bool) {
+        optimizationEnabled = enabled
+        persistOptimizationSettings()
+    }
+
+    func setOptimizationAllowAV1Passthrough(_ enabled: Bool) {
+        optimizationAllowAV1Passthrough = enabled
+        persistOptimizationSettings()
+    }
+
+    func setOptimizationTranscodeH264ToHEVC(_ enabled: Bool) {
+        optimizationTranscodeH264ToHEVC = enabled
+        persistOptimizationSettings()
+    }
+
+    func setOptimizationForceSoftwareAV1Encode(_ enabled: Bool) {
+        if enabled && !optimizationHardwareAV1DecodeAvailable {
+            optimizationForceSoftwareAV1Encode = false
+            statusMessage = "AV1 force encode unavailable: no hardware AV1 decode."
+            return
+        }
+        optimizationForceSoftwareAV1Encode = enabled
+        persistOptimizationSettings()
+    }
+
+    func setOptimizationProfile(_ profile: OptimizationProfile) {
+        optimizationProfile = profile
+        persistOptimizationSettings()
     }
 
     func preview() {
         configurePreview(for: videoURL)
     }
 
-    private func apply(status: ControlStatus, refreshPreview: Bool = true) {
+    private func currentOptimizationSettings() -> VideoOptimizationSettings {
+        VideoOptimizationSettings(
+            enabled: optimizationEnabled,
+            allowAV1PassthroughOnHardwareDecode: optimizationAllowAV1Passthrough,
+            transcodeH264ToHEVC: optimizationTranscodeH264ToHEVC,
+            forceSoftwareAV1Encode: (
+                optimizationForceSoftwareAV1Encode
+                && optimizationHardwareAV1DecodeAvailable
+            ),
+            profile: optimizationProfile
+        )
+    }
+
+    private func applyOptimizationSettings(_ settings: VideoOptimizationSettings) {
+        optimizationEnabled = settings.enabled
+        optimizationAllowAV1Passthrough = settings.allowAV1PassthroughOnHardwareDecode
+        optimizationTranscodeH264ToHEVC = settings.transcodeH264ToHEVC
+        optimizationForceSoftwareAV1Encode = (
+            settings.forceSoftwareAV1Encode && optimizationHardwareAV1DecodeAvailable
+        )
+        optimizationProfile = settings.profile
+    }
+
+    private func persistOptimizationSettings() {
+        optimizationStore.save(currentOptimizationSettings())
+    }
+
+    private func prepareVideoURLForPlayback(_ sourceURL: URL) async throws -> (url: URL, summary: String?) {
+        let settings = currentOptimizationSettings()
+        guard settings.enabled else {
+            return (sourceURL, nil)
+        }
+
+        optimizationInProgress = true
+        optimizationProgress = 0
+        optimizationLabel = "Preparing optimization..."
+        defer {
+            optimizationInProgress = false
+            optimizationProgress = 0
+            optimizationLabel = nil
+        }
+
+        let result = try await optimizer.optimizeIfNeeded(
+            inputURL: sourceURL,
+            settings: settings,
+            progress: { [weak self] progress in
+                Task { @MainActor [weak self] in
+                    let value = min(max(progress, 0), 1)
+                    self?.optimizationProgress = value
+                    let percent = Int((value * 100).rounded())
+                    self?.optimizationLabel = "Optimizing video: \(percent)%"
+                }
+            }
+        )
+
+        switch result.decision {
+        case .passthrough(let reason):
+            return (result.outputURL, reason)
+        case .transcode(let reason):
+            let summary: String
+            if result.fromCache {
+                summary = "Using cached optimized video. \(reason)"
+            } else {
+                summary = "Video optimized for macOS playback. \(reason)"
+            }
+            return (result.outputURL, summary)
+        }
+    }
+
+    private func apply(
+        status: ControlStatus,
+        refreshPreview: Bool = true,
+        backgroundUpdate: Bool = false
+    ) {
         isRunning = status.running
         playbackSpeed = status.config.playback_speed
         autostartEnabled = status.autostart ?? status.config.autostart ?? false
+        blendInterpolationEnabled = status.config.blend_interpolation ?? false
+        pauseOnFullscreenEnabled = status.config.pause_on_fullscreen ?? true
+        let previousScaleMode = scaleMode
+        scaleMode = WallpaperScaleMode(rawValue: status.config.scale_mode ?? "fill") ?? .fill
         if !status.config.video_path.isEmpty {
             let currentURL = URL(fileURLWithPath: status.config.video_path)
             let hasVideoChanged = videoURL?.path != currentURL.path
             videoURL = currentURL
-            if refreshPreview && (hasVideoChanged || previewPlayer == nil) {
+            if refreshPreview && (hasVideoChanged || previewPlayer == nil || previousScaleMode != scaleMode) {
                 configurePreview(for: currentURL)
             }
         } else {
             videoURL = nil
             previewPlayer = nil
         }
+        syncPreviewPlaybackRate()
+        evaluateStatusContract(status, backgroundUpdate: backgroundUpdate)
+        evaluateDaemonHealth(status.health, backgroundUpdate: backgroundUpdate)
     }
 
     private func startHealthMonitor() {
@@ -523,6 +967,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func recoverPlaybackIfUnexpectedlyStopped() async {
+        guard !isShuttingDown else { return }
         guard let controller else { return }
         guard !isBusy else { return }
         guard !isHealthCheckInProgress else { return }
@@ -535,19 +980,72 @@ final class AppViewModel: ObservableObject {
             let hasVideo = !status.config.video_path.isEmpty
             let paused = status.paused ?? false
             let shouldRecover = isRunning && !status.running && !paused && hasVideo
+            apply(status: status, refreshPreview: false, backgroundUpdate: true)
 
-            if shouldRecover {
+            let healthSuspicious = status.health?.suspicious ?? false
+            let shouldRecoverSuspiciousDaemon = (
+                isRunning
+                && status.running
+                && !paused
+                && hasVideo
+                && healthSuspicious
+                && daemonSuspiciousPolls >= daemonSuspiciousThreshold
+            )
+
+            if shouldRecover || shouldRecoverSuspiciousDaemon {
                 let recoveredStatus = try await runAsync {
                     try controller.start(videoURL: nil, speed: nil)
                 }
-                apply(status: recoveredStatus, refreshPreview: false)
-                statusMessage = "Playback recovered after interruption."
+                apply(status: recoveredStatus, refreshPreview: false, backgroundUpdate: true)
+                recordBridgeSuccess()
+                if shouldRecoverSuspiciousDaemon {
+                    statusMessage = "Daemon recovered from suspicious state."
+                } else {
+                    statusMessage = "Playback recovered after interruption."
+                }
                 alertMessage = nil
-            } else {
-                apply(status: status, refreshPreview: false)
             }
         } catch {
-            // Ignore background health check errors to avoid noisy alerts.
+            recordBridgeFailure(error, context: "background-health", surface: false)
+        }
+    }
+
+    private func startMonitoringLoop() {
+        monitoringTask?.cancel()
+        monitoringTask = Task { [weak self] in
+            guard let self else { return }
+            await self.refreshMonitoringSnapshot(surfaceErrors: false)
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard self.isMonitoringOpen else { return }
+                await self.refreshMonitoringSnapshot(surfaceErrors: false)
+            }
+        }
+    }
+
+    private func refreshMonitoringSnapshot(surfaceErrors: Bool) async {
+        guard !isShuttingDown else { return }
+        guard isMonitoringOpen else { return }
+        guard let controller else {
+            monitoringErrorMessage = "Python bridge unavailable."
+            return
+        }
+        if isMonitoringRefreshing {
+            return
+        }
+
+        isMonitoringRefreshing = true
+        defer { isMonitoringRefreshing = false }
+
+        do {
+            let metrics = try await runAsync { try controller.metrics() }
+            monitoringSnapshot = metrics
+            monitoringErrorMessage = nil
+        } catch {
+            monitoringErrorMessage = error.localizedDescription
+            if surfaceErrors {
+                alertMessage = "Failed to refresh monitoring: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -627,20 +1125,39 @@ final class AppViewModel: ObservableObject {
         player.isMuted = true
         player.volume = 0
         player.play()
+        player.rate = previewPlaybackRate()
 
         previewEndObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
             queue: .main
-        ) { _ in
+        ) { [weak self] _ in
             player.seek(to: .zero)
             player.play()
+            Task { @MainActor [weak self] in
+                player.rate = self?.previewPlaybackRate() ?? 1.0
+            }
         }
 
         previewPlayer = player
     }
 
+    private func previewPlaybackRate() -> Float {
+        Float(max(0.1, min(playbackSpeed, 4.0)))
+    }
+
+    private func syncPreviewPlaybackRate() {
+        guard let previewPlayer else { return }
+        let rate = previewPlaybackRate()
+        if previewPlayer.rate == rate {
+            return
+        }
+        previewPlayer.play()
+        previewPlayer.rate = rate
+    }
+
     private func startFromAutostartIfNeeded(using status: ControlStatus) async {
+        guard !isShuttingDown else { return }
         guard let controller else { return }
         guard !didAttemptAutostartOnLaunch else { return }
         didAttemptAutostartOnLaunch = true
@@ -655,10 +1172,117 @@ final class AppViewModel: ObservableObject {
                 try controller.start(videoURL: nil, speed: nil)
             }
             apply(status: updatedStatus)
+            recordBridgeSuccess()
             statusMessage = "Launch at login: wallpaper started."
             alertMessage = nil
         } catch {
-            alertMessage = "Launch at login error: \(error.localizedDescription)"
+            recordBridgeFailure(error, context: "autostart-start")
+            if bridgeFailureCount < bridgeFailureThreshold {
+                alertMessage = "Launch at login error: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func evaluateStatusContract(
+        _ status: ControlStatus,
+        backgroundUpdate: Bool
+    ) {
+        guard let version = status.contract_version else { return }
+        guard version < expectedStatusContractVersion else { return }
+
+        daemonSuspiciousPolls = max(daemonSuspiciousPolls, daemonSuspiciousThreshold)
+        let message = "Control contract mismatch (expected \(expectedStatusContractVersion), got \(version))."
+        if !backgroundUpdate {
+            alertMessage = message
+        } else {
+            statusMessage = "Daemon contract warning."
+        }
+    }
+
+    private func evaluateDaemonHealth(
+        _ health: DaemonHealth?,
+        backgroundUpdate: Bool
+    ) {
+        guard let health else {
+            daemonSuspiciousPolls = 0
+            lowPowerAutoPauseActive = false
+            fullscreenAutoPauseActive = false
+            return
+        }
+
+        let autoPausedForLowPower = health.auto_paused_for_low_power ?? false
+        if autoPausedForLowPower && !lowPowerAutoPauseActive {
+            lowPowerAutoPauseActive = true
+            statusMessage = "Low Power Mode: wallpaper paused automatically."
+        } else if !autoPausedForLowPower && lowPowerAutoPauseActive {
+            lowPowerAutoPauseActive = false
+            statusMessage = "Low Power Mode off: wallpaper resumed."
+        }
+
+        let autoPausedForFullscreen = health.auto_paused_for_fullscreen ?? false
+        if autoPausedForFullscreen && !fullscreenAutoPauseActive {
+            fullscreenAutoPauseActive = true
+            statusMessage = "Fullscreen app detected: wallpaper paused."
+        } else if !autoPausedForFullscreen && fullscreenAutoPauseActive {
+            fullscreenAutoPauseActive = false
+            statusMessage = "Fullscreen app closed: wallpaper resumed."
+        }
+
+        let suspicious = health.suspicious ?? false
+        if suspicious {
+            daemonSuspiciousPolls += 1
+            if daemonSuspiciousPolls == daemonSuspiciousThreshold {
+                let reason = normalizedDaemonReason(health.reason)
+                let warning = "Daemon warning: \(reason)."
+                if backgroundUpdate {
+                    statusMessage = warning
+                } else {
+                    alertMessage = warning
+                }
+            }
+        } else {
+            daemonSuspiciousPolls = 0
+        }
+    }
+
+    private func normalizedDaemonReason(_ reason: String?) -> String {
+        let trimmed = reason?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmed.isEmpty {
+            return "unknown issue"
+        }
+        return trimmed.replacingOccurrences(of: ",", with: ", ")
+    }
+
+    private func beginShutdown() {
+        guard !isShuttingDown else { return }
+        isShuttingDown = true
+        healthMonitorTask?.cancel()
+        monitoringTask?.cancel()
+    }
+
+    private func recordBridgeSuccess() {
+        if bridgeFailureCount >= bridgeFailureThreshold {
+            statusMessage = "Python bridge recovered."
+        }
+        bridgeFailureCount = 0
+    }
+
+    private func recordBridgeFailure(
+        _ error: Error,
+        context: String,
+        surface: Bool = true
+    ) {
+        bridgeFailureCount += 1
+        let description = error.localizedDescription
+
+        if bridgeFailureCount >= bridgeFailureThreshold {
+            alertMessage = "Python bridge unstable (\(context)): \(description)"
+            statusMessage = "Bridge health warning."
+            return
+        }
+
+        if surface {
+            alertMessage = description
         }
     }
 

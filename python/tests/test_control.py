@@ -115,6 +115,88 @@ class ControlCLITests(unittest.TestCase):
         restore.assert_called_once_with(delete_backup=False)
         printer.assert_called_once()
 
+    def test_command_set_interpolation_restarts_running_daemon(self):
+        args = Namespace(state="on")
+        config = {
+            "video_path": "/tmp/video.mp4",
+            "playback_speed": 1.0,
+            "volume": 0.0,
+            "autostart": False,
+            "blend_interpolation": True,
+            "pause_on_fullscreen": True,
+            "scale_mode": "fill",
+        }
+        with mock.patch.object(control, "update_config", return_value=config):
+            with mock.patch.object(control, "daemon_running", return_value=True):
+                with mock.patch.object(control, "restart_daemon") as restart:
+                    with mock.patch.object(control, "build_status", return_value={"running": True, "config": config, "pid": 1, "autostart": False}):
+                        with mock.patch("builtins.print") as printer:
+                            control.command_set_interpolation(args)
+
+        restart.assert_called_once()
+        printer.assert_called_once()
+
+    def test_command_set_fullscreen_pause_restarts_running_daemon(self):
+        args = Namespace(state="off")
+        config = {
+            "video_path": "/tmp/video.mp4",
+            "playback_speed": 1.0,
+            "volume": 0.0,
+            "autostart": False,
+            "blend_interpolation": False,
+            "pause_on_fullscreen": False,
+            "scale_mode": "fill",
+        }
+        with mock.patch.object(control, "update_config", return_value=config):
+            with mock.patch.object(control, "daemon_running", return_value=True):
+                with mock.patch.object(control, "restart_daemon") as restart:
+                    with mock.patch.object(control, "build_status", return_value={"running": True, "config": config, "pid": 1, "autostart": False}):
+                        with mock.patch("builtins.print") as printer:
+                            control.command_set_fullscreen_pause(args)
+
+        restart.assert_called_once()
+        printer.assert_called_once()
+
+    def test_command_set_scale_restarts_running_daemon(self):
+        args = Namespace(mode="fit")
+        config = {
+            "video_path": "/tmp/video.mp4",
+            "playback_speed": 1.0,
+            "volume": 0.0,
+            "autostart": False,
+            "blend_interpolation": False,
+            "pause_on_fullscreen": True,
+            "scale_mode": "fit",
+        }
+        with mock.patch.object(control, "update_config", return_value=config):
+            with mock.patch.object(control, "daemon_running", return_value=True):
+                with mock.patch.object(control, "restart_daemon") as restart:
+                    with mock.patch.object(control, "build_status", return_value={"running": True, "config": config, "pid": 1, "autostart": False}):
+                        with mock.patch("builtins.print") as printer:
+                            control.command_set_scale(args)
+
+        restart.assert_called_once()
+        printer.assert_called_once()
+
+    def test_command_metrics_prints_payload(self):
+        args = Namespace()
+        payload = {"running": True, "cpu_percent": 3.2}
+        with mock.patch.object(control, "daemon_resource_metrics", return_value=payload):
+            with mock.patch("builtins.print") as printer:
+                control.command_metrics(args)
+
+        printer.assert_called_once()
+
+    def test_command_terminate_daemon_stops_process(self):
+        args = Namespace()
+        with mock.patch.object(control, "stop_daemon") as stop:
+            with mock.patch.object(control, "build_status", return_value={"running": False, "config": {}, "pid": None, "autostart": False}):
+                with mock.patch("builtins.print") as printer:
+                    control.command_terminate_daemon(args)
+
+        stop.assert_called_once()
+        printer.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

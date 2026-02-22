@@ -16,6 +16,8 @@ from typing import Any, Dict, Optional
 
 from daemon_manager import (
     autostart_enabled,
+    daemon_health,
+    daemon_resource_metrics,
     daemon_paused,
     disable_autostart,
     enable_autostart,
@@ -34,7 +36,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "playback_speed": 1.0,
     "volume": 0.0,
     "autostart": False,
+    "blend_interpolation": False,
+    "pause_on_fullscreen": True,
+    "scale_mode": "fill",
 }
+STATUS_CONTRACT_VERSION = 2
 
 
 def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
@@ -65,11 +71,13 @@ def build_status(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     alive = daemon_running()
     paused = daemon_paused()
     return {
+        "contract_version": STATUS_CONTRACT_VERSION,
         "running": alive and not paused,
         "config": config,
         "pid": load_pid() if alive else None,
         "autostart": autostart_enabled(),
         "paused": paused,
+        "health": daemon_health(alive=alive, paused=paused),
     }
 
 
@@ -92,10 +100,17 @@ def command_start(args):
             video_path=config["video_path"],
             playback_speed=config["playback_speed"],
             volume=config.get("volume", 0.0),
+            blend_interpolation=config.get("blend_interpolation", False),
+            pause_on_fullscreen=config.get("pause_on_fullscreen", True),
+            scale_mode=config.get("scale_mode", "fill"),
             wait=0.35,
         )
     else:
-        start_daemon(wait=0.35)
+        start_daemon(
+            blend_interpolation=config.get("blend_interpolation", False),
+            pause_on_fullscreen=config.get("pause_on_fullscreen", True),
+            wait=0.35,
+        )
     print(json.dumps(build_status(config)))
 
 
@@ -117,6 +132,9 @@ def command_set_video(args):
             video_path=video_path,
             playback_speed=config["playback_speed"],
             volume=config.get("volume", 0.0),
+            blend_interpolation=config.get("blend_interpolation", False),
+            pause_on_fullscreen=config.get("pause_on_fullscreen", True),
+            scale_mode=config.get("scale_mode", "fill"),
             wait=0.35,
         )
     payload = build_status(config)
@@ -130,6 +148,54 @@ def command_set_speed(args):
         restart_daemon(
             playback_speed=config["playback_speed"],
             volume=config.get("volume", 0.0),
+            blend_interpolation=config.get("blend_interpolation", False),
+            pause_on_fullscreen=config.get("pause_on_fullscreen", True),
+            scale_mode=config.get("scale_mode", "fill"),
+            wait=0.35,
+        )
+    print(json.dumps(build_status(config)))
+
+
+def command_set_interpolation(args):
+    enabled = args.state == "on"
+    config = update_config({"blend_interpolation": enabled}, CONFIG_PATH)
+    if daemon_running():
+        restart_daemon(
+            playback_speed=config["playback_speed"],
+            volume=config.get("volume", 0.0),
+            blend_interpolation=enabled,
+            pause_on_fullscreen=config.get("pause_on_fullscreen", True),
+            scale_mode=config.get("scale_mode", "fill"),
+            wait=0.35,
+        )
+    print(json.dumps(build_status(config)))
+
+
+def command_set_fullscreen_pause(args):
+    enabled = args.state == "on"
+    config = update_config({"pause_on_fullscreen": enabled}, CONFIG_PATH)
+    if daemon_running():
+        restart_daemon(
+            playback_speed=config["playback_speed"],
+            volume=config.get("volume", 0.0),
+            blend_interpolation=config.get("blend_interpolation", False),
+            pause_on_fullscreen=enabled,
+            scale_mode=config.get("scale_mode", "fill"),
+            wait=0.35,
+        )
+    print(json.dumps(build_status(config)))
+
+
+def command_set_scale(args):
+    mode = args.mode
+    config = update_config({"scale_mode": mode}, CONFIG_PATH)
+    if daemon_running():
+        restart_daemon(
+            playback_speed=config["playback_speed"],
+            volume=config.get("volume", 0.0),
+            blend_interpolation=config.get("blend_interpolation", False),
+            pause_on_fullscreen=config.get("pause_on_fullscreen", True),
+            scale_mode=mode,
             wait=0.35,
         )
     print(json.dumps(build_status(config)))
@@ -141,6 +207,17 @@ def command_clear_wallpaper(_args):
     payload = build_status()
     payload["wallpaper_restored"] = restored
     print(json.dumps(payload))
+
+
+def command_terminate_daemon(_args):
+    stop_daemon()
+    payload = build_status()
+    payload["terminated"] = True
+    print(json.dumps(payload))
+
+
+def command_metrics(_args):
+    print(json.dumps(daemon_resource_metrics()))
 
 
 def command_autostart(args):
@@ -193,11 +270,56 @@ def build_parser():
     speed_parser.add_argument("speed", type=float, help="New playback speed.")
     speed_parser.set_defaults(func=command_set_speed)
 
+    interpolation_parser = subparsers.add_parser(
+        "set-interpolation",
+        help="Toggle lightweight frame-blend interpolation.",
+    )
+    interpolation_parser.add_argument(
+        "state",
+        choices=["on", "off"],
+        help="Enable (on) or disable (off) frame blending.",
+    )
+    interpolation_parser.set_defaults(func=command_set_interpolation)
+
+    fullscreen_pause_parser = subparsers.add_parser(
+        "set-fullscreen-pause",
+        help="Toggle automatic pause when fullscreen apps are active.",
+    )
+    fullscreen_pause_parser.add_argument(
+        "state",
+        choices=["on", "off"],
+        help="Enable (on) or disable (off) fullscreen auto-pause.",
+    )
+    fullscreen_pause_parser.set_defaults(func=command_set_fullscreen_pause)
+
+    scale_parser = subparsers.add_parser(
+        "set-scale",
+        help="Set wallpaper scale mode.",
+    )
+    scale_parser.add_argument(
+        "mode",
+        choices=["fill", "fit", "stretch"],
+        help="Scale algorithm: fill, fit, or stretch.",
+    )
+    scale_parser.set_defaults(func=command_set_scale)
+
     clear_parser = subparsers.add_parser(
         "clear-wallpaper",
         help="Stop playback and restore the previously configured macOS wallpaper.",
     )
     clear_parser.set_defaults(func=command_clear_wallpaper)
+
+    terminate_parser = subparsers.add_parser(
+        "terminate-daemon",
+        help="Kill daemon process and clean runtime state files.",
+    )
+    terminate_parser.set_defaults(func=command_terminate_daemon)
+
+    metrics_parser = subparsers.add_parser(
+        "metrics",
+        help="Report daemon CPU/memory and playback health metrics.",
+    )
+    metrics_parser.set_defaults(func=command_metrics)
 
     auto_parser = subparsers.add_parser("set-autostart", help="Toggle autostart.")
     auto_parser.add_argument(
