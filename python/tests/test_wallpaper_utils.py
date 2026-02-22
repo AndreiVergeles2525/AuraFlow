@@ -78,10 +78,25 @@ class WallpaperUtilsTests(unittest.TestCase):
                                     "_fallback_system_wallpaper",
                                     return_value={"1": str(fallback_image)},
                                 ):
-                                    restored = wallpaper_utils.restore_wallpaper_backup()
+                                    restored = wallpaper_utils.restore_wallpaper_backup(
+                                        allow_fallback=True
+                                    )
 
             self.assertTrue(restored)
             fake_workspace.setDesktopImageURL_forScreen_options_error_.assert_called_once()
+
+    def test_restore_wallpaper_backup_skips_fallback_by_default(self):
+        with mock.patch.object(wallpaper_utils, "_require_macos_frameworks"):
+            with mock.patch.object(wallpaper_utils, "_load_wallpaper_backup", return_value={}):
+                with mock.patch.object(
+                    wallpaper_utils,
+                    "_fallback_system_wallpaper",
+                    return_value={"1": "/System/Library/Desktop Pictures/Default.heic"},
+                ) as fallback:
+                    restored = wallpaper_utils.restore_wallpaper_backup()
+
+        self.assertFalse(restored)
+        fallback.assert_not_called()
 
     def test_restore_wallpaper_backup_does_not_delete_backup_by_default(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -115,6 +130,24 @@ class WallpaperUtilsTests(unittest.TestCase):
 
             self.assertTrue(restored)
             self.assertTrue(backup_path.exists())
+
+    def test_save_wallpaper_backup_refreshes_when_user_wallpaper_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            backup_path = temp_root / "wallpaper_backup.json"
+            backup_path.write_text('{"1": "/old/path.heic"}', encoding="utf-8")
+
+            with mock.patch.object(wallpaper_utils, "WALLPAPER_BACKUP_PATH", backup_path):
+                with mock.patch.object(wallpaper_utils, "ensure_app_support_dir"):
+                    with mock.patch.object(
+                        wallpaper_utils,
+                        "_current_wallpapers",
+                        return_value={"1": "/new/path.heic"},
+                    ):
+                        wallpaper_utils._save_wallpaper_backup_if_needed()
+
+            content = backup_path.read_text(encoding="utf-8")
+            self.assertIn("/new/path.heic", content)
 
 
 if __name__ == "__main__":

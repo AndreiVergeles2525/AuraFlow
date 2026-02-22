@@ -136,8 +136,11 @@ def command_set_speed(args):
 
 
 def command_clear_wallpaper(_args):
-    stop_daemon()
-    restored = restore_wallpaper_backup(delete_backup=False)
+    stop_daemon(timeout=0.6)
+    restored = restore_wallpaper_backup(
+        delete_backup=False,
+        allow_fallback=False,
+    )
     payload = build_status()
     payload["wallpaper_restored"] = restored
     print(json.dumps(payload))

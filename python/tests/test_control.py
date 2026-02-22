@@ -111,8 +111,8 @@ class ControlCLITests(unittest.TestCase):
                 with mock.patch.object(control, "build_status", return_value={"running": False, "config": {}, "pid": None, "autostart": False}):
                     with mock.patch("builtins.print") as printer:
                         control.command_clear_wallpaper(args)
-        stop.assert_called_once()
-        restore.assert_called_once_with(delete_backup=False)
+        stop.assert_called_once_with(timeout=0.6)
+        restore.assert_called_once_with(delete_backup=False, allow_fallback=False)
         printer.assert_called_once()
 
 

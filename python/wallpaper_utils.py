@@ -65,7 +65,12 @@ def _load_wallpaper_backup() -> dict[str, str]:
 
     wallpapers: dict[str, str] = {}
     for key, value in data.items():
-        if isinstance(key, str) and isinstance(value, str) and value:
+        if (
+            isinstance(key, str)
+            and isinstance(value, str)
+            and value
+            and not _is_managed_wallpaper(value)
+        ):
             wallpapers[key] = value
     return wallpapers
 
@@ -85,17 +90,15 @@ def _is_managed_wallpaper(path: str) -> bool:
 def _save_wallpaper_backup_if_needed() -> None:
     ensure_app_support_dir()
 
-    if WALLPAPER_BACKUP_PATH.exists():
-        if _load_wallpaper_backup():
-            return
-        WALLPAPER_BACKUP_PATH.unlink(missing_ok=True)
-
     wallpapers = {
         screen_id: path
         for screen_id, path in _current_wallpapers().items()
         if not _is_managed_wallpaper(path)
     }
     if not wallpapers:
+        return
+    existing = _load_wallpaper_backup()
+    if existing == wallpapers:
         return
 
     WALLPAPER_BACKUP_PATH.write_text(
@@ -144,16 +147,22 @@ def _fallback_system_wallpaper() -> dict[str, str]:
     return {_screen_identifier(screen): default_image for screen in AppKit.NSScreen.screens()}
 
 
-def restore_wallpaper_backup(delete_backup: bool = False) -> bool:
+def restore_wallpaper_backup(
+    delete_backup: bool = False,
+    allow_fallback: bool = False,
+) -> bool:
     """
-    Restore system wallpaper URLs captured before AuraFlow first changed them.
+    Restore system wallpaper URLs captured before AuraFlow changed them.
+
+    By default this restores only known user wallpaper paths from backup.
+    Optional fallback to macOS defaults can be enabled explicitly.
     """
 
     _require_macos_frameworks()
     wallpapers = _load_wallpaper_backup()
     restored = _restore_wallpaper_paths(wallpapers) if wallpapers else False
 
-    if not restored:
+    if not restored and allow_fallback:
         fallback_wallpapers = _fallback_system_wallpaper()
         if fallback_wallpapers:
             restored = _restore_wallpaper_paths(fallback_wallpapers)
