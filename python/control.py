@@ -106,11 +106,8 @@ def command_start(args):
             wait=0.35,
         )
     else:
-        start_daemon(
-            blend_interpolation=config.get("blend_interpolation", False),
-            pause_on_fullscreen=config.get("pause_on_fullscreen", True),
-            wait=0.35,
-        )
+        # Keep plain start as a true resume/no-op path for paused/running daemon.
+        start_daemon(wait=0.35)
     print(json.dumps(build_status(config)))
 
 
@@ -202,8 +199,13 @@ def command_set_scale(args):
 
 
 def command_clear_wallpaper(_args):
-    stop_daemon()
-    restored = restore_wallpaper_backup(delete_backup=False)
+    restored = restore_wallpaper_backup(
+        delete_backup=False,
+        allow_fallback=False,
+    )
+    # Restore user wallpaper first to avoid a visible desktop flicker while
+    # daemon teardown finishes.
+    stop_daemon(timeout=0.35)
     payload = build_status()
     payload["wallpaper_restored"] = restored
     print(json.dumps(payload))

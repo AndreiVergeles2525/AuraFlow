@@ -15,6 +15,7 @@ import json
 import signal
 import sys
 import os
+import subprocess
 import time
 import threading
 from dataclasses import dataclass
@@ -31,11 +32,13 @@ import CoreMedia
 import Quartz
 
 from paths import (
+    APP_SUPPORT_DIR,
     CONFIG_PATH,
     DAEMON_COMMAND_PATH,
     DAEMON_HEALTH_PATH,
     DAEMON_LOCK_PATH,
     DAEMON_PAUSED_PATH,
+    LAST_FRAME_PATH,
     ensure_app_support_dir,
     PID_PATH,
 )
@@ -47,6 +50,88 @@ SCALE_MODE_TO_GRAVITY = {
 }
 DEFAULT_SCALE_MODE = "fill"
 _DAEMON_LOCK_HANDLE = None
+
+
+def _managed_frame_suffix() -> str:
+    return LAST_FRAME_PATH.suffix or ".png"
+
+
+def _next_managed_frame_path() -> Path:
+    suffix = _managed_frame_suffix()
+    unique = f"{LAST_FRAME_PATH.stem}_{int(time.time() * 1000)}_{os.getpid()}{suffix}"
+    return LAST_FRAME_PATH.with_name(unique)
+
+
+def _sync_last_frame_alias(source_path: Path) -> None:
+    ensure_app_support_dir()
+    alias = LAST_FRAME_PATH
+    temp_alias = alias.with_name(f"{alias.stem}.tmp{_managed_frame_suffix()}")
+    temp_alias.unlink(missing_ok=True)
+    source_data = source_path.read_bytes()
+    temp_alias.write_bytes(source_data)
+    temp_alias.replace(alias)
+
+
+def _cleanup_old_managed_frames(keep: Path) -> None:
+    suffix = _managed_frame_suffix()
+    pattern = f"{LAST_FRAME_PATH.stem}_*{suffix}"
+    try:
+        files = sorted(
+            APP_SUPPORT_DIR.glob(pattern),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+
+    keep_resolved = keep.expanduser().resolve(strict=False)
+    retained = 0
+    for path in files:
+        try:
+            resolved = path.expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        if resolved == keep_resolved:
+            retained += 1
+            continue
+        if retained < 3:
+            retained += 1
+            continue
+        path.unlink(missing_ok=True)
+
+
+def _run_osascript(script: str):
+    try:
+        return subprocess.run(  # noqa: S603
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+
+
+def _set_all_desktops_picture_via_system_events(path: str) -> None:
+    escaped_path = path.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        'tell application "System Events"\n'
+        f'  repeat with d in desktops\n'
+        f'    set picture of d to POSIX file "{escaped_path}"\n'
+        "  end repeat\n"
+        "end tell"
+    )
+    _run_osascript(script)
+
+
+def _apply_wallpaper_to_all_desktops(frame_path: Path) -> None:
+    workspace = AppKit.NSWorkspace.sharedWorkspace()
+    url = NSURL.fileURLWithPath_(str(frame_path))
+    for screen in AppKit.NSScreen.screens():
+        workspace.setDesktopImageURL_forScreen_options_error_(url, screen, {}, None)
+    _set_all_desktops_picture_via_system_events(
+        str(frame_path.expanduser().resolve(strict=False))
+    )
 
 
 @dataclass
@@ -507,6 +592,7 @@ class AuraFlowController(NSObject):
 
         if self._player is None:
             return
+        self._persist_current_frame_as_wallpaper()
         self._manual_paused = True
         self._auto_paused_for_low_power = False
         self._auto_paused_for_fullscreen = False
@@ -665,6 +751,50 @@ class AuraFlowController(NSObject):
             return bool(NSProcessInfo.processInfo().isLowPowerModeEnabled())
         except Exception:
             return False
+
+    def _persist_current_frame_as_wallpaper(self):
+        if self._player is None:
+            return
+
+        current_item = self._player.currentItem()
+        if current_item is None:
+            return
+
+        asset = current_item.asset()
+        if asset is None:
+            return
+
+        try:
+            generator = AVFoundation.AVAssetImageGenerator.assetImageGeneratorWithAsset_(asset)
+            generator.setAppliesPreferredTrackTransform_(True)
+            current_time = self._player.currentTime()
+            result = generator.copyCGImageAtTime_actualTime_error_(current_time, None, None)
+            cg_image = result[0] if isinstance(result, tuple) else result
+            if cg_image is None:
+                return
+
+            image = AppKit.NSImage.alloc().initWithCGImage_size_(cg_image, AppKit.NSZeroSize)
+            bitmap = AppKit.NSBitmapImageRep.alloc().initWithCGImage_(cg_image)
+            if bitmap is None:
+                tiff_data = image.TIFFRepresentation()
+                if tiff_data is not None:
+                    bitmap = AppKit.NSBitmapImageRep.imageRepWithData_(tiff_data)
+            if bitmap is None:
+                return
+
+            png_data = bitmap.representationUsingType_properties_(AppKit.NSPNGFileType, None)
+            if png_data is None:
+                return
+
+            ensure_app_support_dir()
+            destination = _next_managed_frame_path()
+            with destination.open("wb") as handle:
+                handle.write(bytes(png_data))
+            _sync_last_frame_alias(destination)
+            _cleanup_old_managed_frames(destination)
+            _apply_wallpaper_to_all_desktops(destination)
+        except Exception:
+            return
 
 
 class WallpaperAppDelegate(NSObject):

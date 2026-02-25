@@ -4,6 +4,7 @@ let auraFlowMainWindowIdentifier = NSUserInterfaceItemIdentifier("AuraFlowMainWi
 
 func configureWindowForClientDecorations(_ window: NSWindow) {
     window.identifier = auraFlowMainWindowIdentifier
+    window.animationBehavior = .none
     window.tabbingMode = .disallowed
     window.titleVisibility = .hidden
     window.titlebarAppearsTransparent = true

@@ -75,6 +75,10 @@ struct ContentView: View {
                 if viewModel.isMonitoringOpen {
                     MonitoringPopupOverlay(viewModel: viewModel)
                 }
+
+                if viewModel.isDownloadedWallpapersOpen {
+                    DownloadedWallpapersOverlay(viewModel: viewModel)
+                }
             }
         }
         .frame(minWidth: 760, minHeight: 480)
@@ -123,6 +127,12 @@ struct ControlPanel: View {
                     .buttonStyle(.bordered)
                     .disabled(!viewModel.canClearWallpaper)
 
+                    Button("Downloaded Wallpapers") {
+                        viewModel.openDownloadedWallpapers()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!viewModel.canClearWallpaper)
+
                     Button("Change Wallpaper…") {
                         viewModel.chooseVideo()
                     }
@@ -134,6 +144,12 @@ struct ControlPanel: View {
                     HStack(spacing: 10) {
                         Button("Wallpaper Catalog") {
                             viewModel.openCatalog()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!viewModel.canClearWallpaper)
+
+                        Button("Downloaded Wallpapers") {
+                            viewModel.openDownloadedWallpapers()
                         }
                         .buttonStyle(.bordered)
                         .disabled(!viewModel.canClearWallpaper)
@@ -529,6 +545,120 @@ struct MonitoringRow: View {
     }
 }
 
+struct DownloadedWallpapersOverlay: View {
+    @ObservedObject var viewModel: AppViewModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(colorScheme == .dark ? 0.42 : 0.28)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    viewModel.closeDownloadedWallpapers()
+                }
+
+            DownloadedWallpapersCard(viewModel: viewModel)
+                .frame(maxWidth: 760)
+                .padding(.horizontal, 24)
+                .transition(
+                    .asymmetric(
+                        insertion: .scale(scale: 0.94).combined(with: .opacity),
+                        removal: .opacity
+                    )
+                )
+        }
+        .animation(.spring(response: 0.3, dampingFraction: 0.86), value: viewModel.isDownloadedWallpapersOpen)
+        .zIndex(70)
+    }
+}
+
+struct DownloadedWallpapersCard: View {
+    @ObservedObject var viewModel: AppViewModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Downloaded Wallpapers", systemImage: "arrow.down.circle.fill")
+                    .font(.headline.weight(.semibold))
+                Spacer()
+                Text("\(viewModel.downloadedCatalogWallpapers.count)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Button {
+                    viewModel.closeDownloadedWallpapers()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Divider()
+
+            if viewModel.downloadedCatalogWallpapers.isEmpty {
+                Text("No downloaded wallpapers yet. Use Download & Apply in the catalog.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(viewModel.downloadedCatalogWallpapers) { wallpaper in
+                            HStack(spacing: 12) {
+                                CatalogPreviewImage(
+                                    url: wallpaper.previewImageURL,
+                                    title: wallpaper.title,
+                                    referer: wallpaper.sourcePageURL
+                                )
+                                .frame(width: 140, height: 80)
+                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(wallpaper.title)
+                                        .font(.subheadline.weight(.semibold))
+                                        .lineLimit(1)
+                                    Text("\(wallpaper.category) • \(wallpaper.attribution)")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Text(wallpaper.localURL.lastPathComponent)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+
+                                Spacer(minLength: 10)
+
+                                Button {
+                                    viewModel.applyDownloadedCatalogWallpaper(wallpaper)
+                                } label: {
+                                    Label("Apply", systemImage: "checkmark.circle")
+                                }
+                                .buttonStyle(.borderedProminent)
+                            }
+                            .padding(8)
+                            .background(Color.black.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        }
+                    }
+                }
+                .frame(maxHeight: 360)
+            }
+        }
+        .padding(.vertical, 16)
+        .padding(.horizontal, 20)
+        .background(
+            LiquidGlassView()
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.white.opacity(colorScheme == .dark ? 0.14 : 0.2), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.45 : 0.28), radius: 24, x: 0, y: 16)
+    }
+}
+
 struct ControlButtons: View {
     @ObservedObject var viewModel: AppViewModel
 
@@ -612,16 +742,26 @@ struct WallpaperCatalogView: View {
                 Spacer()
 
                 if viewModel.selectedCatalogWallpaper == nil {
+                    if viewModel.catalogIsRefreshing {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Text("\(viewModel.catalogWallpapers.count)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
                     TextField("Search catalog", text: $viewModel.catalogSearchText)
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 260)
                 }
             }
+            .zIndex(10)
 
             if let wallpaper = viewModel.selectedCatalogWallpaper {
                 WallpaperCatalogDetailView(viewModel: viewModel, wallpaper: wallpaper)
+                    .zIndex(0)
             } else {
                 WallpaperCatalogGridView(viewModel: viewModel)
+                    .zIndex(0)
             }
         }
         .padding(.vertical, 14)
@@ -653,7 +793,11 @@ struct WallpaperCatalogGridView: View {
                         viewModel.openCatalogWallpaper(wallpaper)
                     } label: {
                         VStack(alignment: .leading, spacing: 8) {
-                            CatalogPreviewImage(url: wallpaper.previewImageURL, title: wallpaper.title)
+                            CatalogPreviewImage(
+                                url: wallpaper.previewImageURL,
+                                title: wallpaper.title,
+                                referer: wallpaper.sourcePageURL
+                            )
                                 .frame(height: 96)
                                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
@@ -683,7 +827,11 @@ struct WallpaperCatalogDetailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            CatalogPreviewImage(url: wallpaper.previewImageURL, title: wallpaper.title)
+            CatalogPreviewImage(
+                url: wallpaper.previewImageURL,
+                title: wallpaper.title,
+                referer: wallpaper.sourcePageURL
+            )
                 .frame(height: 150)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
@@ -725,24 +873,32 @@ struct WallpaperCatalogDetailView: View {
 struct CatalogPreviewImage: View {
     let url: URL?
     let title: String
+    let referer: URL?
+    @StateObject private var loader = CatalogPreviewImageLoader()
 
     var body: some View {
         Group {
-            if let url {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    default:
-                        previewFallback
-                    }
-                }
+            if let image = loader.image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
             } else {
                 previewFallback
             }
         }
+        .task(id: cacheKey) {
+            loader.load(url: url, referer: referer)
+        }
+        .onDisappear {
+            loader.cancel()
+        }
+    }
+
+    private var cacheKey: String {
+        [
+            url?.absoluteString ?? "nil",
+            referer?.absoluteString ?? "nil",
+        ].joined(separator: "|")
     }
 
     private var previewFallback: some View {
@@ -758,6 +914,58 @@ struct CatalogPreviewImage: View {
                 .padding(8)
                 .lineLimit(2)
         }
+    }
+}
+
+final class CatalogPreviewImageLoader: ObservableObject {
+    @Published private(set) var image: NSImage?
+
+    private static let cache = NSCache<NSURL, NSImage>()
+    private var task: Task<Void, Never>?
+
+    func load(url: URL?, referer: URL?) {
+        task?.cancel()
+        task = nil
+        image = nil
+
+        guard let url else {
+            return
+        }
+        if let cached = Self.cache.object(forKey: url as NSURL) {
+            image = cached
+            return
+        }
+
+        task = Task {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 20
+            request.setValue("AuraFlow/1.1", forHTTPHeaderField: "User-Agent")
+            request.setValue("image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+            if let referer {
+                request.setValue(referer.absoluteString, forHTTPHeaderField: "Referer")
+            }
+
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard !Task.isCancelled else { return }
+                if let httpResponse = response as? HTTPURLResponse,
+                   !(200...299).contains(httpResponse.statusCode) {
+                    return
+                }
+                await MainActor.run {
+                    guard let decoded = NSImage(data: data) else { return }
+                    Self.cache.setObject(decoded, forKey: url as NSURL)
+                    self.image = decoded
+                }
+            } catch {
+                // Keep fallback preview on failures.
+            }
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
     }
 }
 

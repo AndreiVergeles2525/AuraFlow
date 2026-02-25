@@ -22,14 +22,18 @@ class DaemonManagerTests(unittest.TestCase):
         patcher_log = mock.patch.object(daemon_manager, "LOG_PATH", self.log_path)
         patcher_health = mock.patch.object(daemon_manager, "DAEMON_HEALTH_PATH", self.health_path)
         patcher_config = mock.patch.object(daemon_manager, "CONFIG_PATH", self.config_path)
+        self.lock_path = Path(self.temp_dir.name) / "daemon.lock"
+        patcher_lock = mock.patch.object(daemon_manager, "DAEMON_LOCK_PATH", self.lock_path)
         self.addCleanup(patcher_pid.stop)
         self.addCleanup(patcher_log.stop)
         self.addCleanup(patcher_health.stop)
         self.addCleanup(patcher_config.stop)
+        self.addCleanup(patcher_lock.stop)
         patcher_pid.start()
         patcher_log.start()
         patcher_health.start()
         patcher_config.start()
+        patcher_lock.start()
         patcher_support = mock.patch.object(daemon_manager, "ensure_app_support_dir")
         self.addCleanup(patcher_support.stop)
         patcher_support.start()
@@ -42,12 +46,27 @@ class DaemonManagerTests(unittest.TestCase):
             self.pid_path.write_text("123", encoding="utf-8")
             return 123
 
-        with mock.patch.object(daemon_manager, "daemon_running", side_effect=[False, True]):
+        with mock.patch.object(daemon_manager, "daemon_running", side_effect=[False]):
             with mock.patch.object(daemon_manager, "_launch_daemon", side_effect=fake_launch):
-                pid = daemon_manager.start_daemon(config_path=self.config_path)
+                with mock.patch.object(daemon_manager, "_resolve_primary_daemon_pid", return_value=123):
+                    with mock.patch.object(daemon_manager, "_cleanup_orphaned_daemons"):
+                        pid = daemon_manager.start_daemon(config_path=self.config_path)
 
         self.assertEqual(pid, 123)
         self.assertTrue(self.pid_path.exists())
+
+    def test_start_daemon_resumes_paused_instance_without_restart(self):
+        with mock.patch.object(daemon_manager, "_cleanup_orphaned_daemons"):
+            with mock.patch.object(daemon_manager, "daemon_running", return_value=True):
+                with mock.patch.object(daemon_manager, "read_pid", return_value=777):
+                    with mock.patch.object(daemon_manager, "daemon_paused", return_value=True):
+                        with mock.patch.object(daemon_manager, "resume_daemon", return_value=True) as resume:
+                            with mock.patch.object(daemon_manager, "restart_daemon") as restart:
+                                pid = daemon_manager.start_daemon(config_path=self.config_path)
+
+        self.assertEqual(pid, 777)
+        resume.assert_called_once()
+        restart.assert_not_called()
 
     def test_stop_daemon_sends_signal_and_removes_pid(self):
         self.pid_path.write_text("321", encoding="utf-8")
@@ -115,6 +134,15 @@ class DaemonManagerTests(unittest.TestCase):
 
         self.assertTrue(running)
         self.assertEqual(self.pid_path.read_text(encoding="utf-8"), "777")
+
+    def test_list_daemon_pids_includes_lock_pid_when_alive(self):
+        self.lock_path.write_text("888", encoding="utf-8")
+
+        with mock.patch.object(daemon_manager, "_pgrep_pids", return_value=set()):
+            with mock.patch.object(daemon_manager, "_pid_is_alive", return_value=True):
+                pids = daemon_manager._list_daemon_pids()
+
+        self.assertEqual(pids, {888})
 
 
 if __name__ == "__main__":

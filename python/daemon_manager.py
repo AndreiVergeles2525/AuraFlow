@@ -20,6 +20,7 @@ from paths import (
     CONFIG_PATH,
     DAEMON_COMMAND_PATH,
     DAEMON_HEALTH_PATH,
+    DAEMON_LOCK_PATH,
     DAEMON_PAUSED_PATH,
     LOG_PATH,
     PID_PATH,
@@ -137,11 +138,65 @@ def _terminate_pid(pid: int, timeout: float = 1.0) -> None:
         return
 
 
+def _terminate_pids(pids: set[int], timeout: float = 1.0) -> None:
+    """
+    Terminate multiple daemon PIDs using one shared timeout budget.
+
+    This avoids additive waits when duplicate/orphan daemon processes exist.
+    """
+
+    alive = {pid for pid in pids if isinstance(pid, int) and pid > 0}
+    if not alive:
+        return
+
+    for pid in list(alive):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            alive.discard(pid)
+
+    deadline = time.time() + max(timeout, 0.2)
+    while alive and time.time() < deadline:
+        for pid in list(alive):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                alive.discard(pid)
+        if alive:
+            time.sleep(0.05)
+
+    for pid in list(alive):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            continue
+
+
 def _list_daemon_pids() -> set[int]:
     script_path = str(_daemon_script())
+    script_name = _daemon_script().name
+
+    pids = _pgrep_pids(script_path)
+    # Fallback for upgrades/moves where an older daemon keeps running from a
+    # different app bundle path but uses the same script name.
+    pids.update(_pgrep_pids(script_name))
+
+    lock_pid = _read_lock_pid()
+    if lock_pid is not None:
+        pids.add(lock_pid)
+
+    current_pid = os.getpid()
+    return {
+        pid
+        for pid in pids
+        if pid != current_pid and _pid_is_alive(pid)
+    }
+
+
+def _pgrep_pids(pattern: str) -> set[int]:
     try:
         result = subprocess.run(  # noqa: S603
-            ["pgrep", "-f", script_path],
+            ["pgrep", "-f", pattern],
             capture_output=True,
             text=True,
             check=False,
@@ -161,15 +216,45 @@ def _list_daemon_pids() -> set[int]:
     return pids
 
 
-def _cleanup_orphaned_daemons(keep: Optional[set[int]] = None) -> None:
+def _read_lock_pid() -> Optional[int]:
+    if not DAEMON_LOCK_PATH.exists():
+        return None
+    try:
+        raw = DAEMON_LOCK_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    if pid <= 0:
+        return None
+    return pid
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _cleanup_orphaned_daemons(
+    keep: Optional[set[int]] = None,
+    timeout: float = 0.5,
+) -> None:
     keep = keep or set()
     active = _list_daemon_pids()
     pid_from_file = read_pid()
     if pid_from_file is not None:
         keep.add(pid_from_file)
 
-    for pid in active - keep:
-        _terminate_pid(pid, timeout=0.5)
+    _terminate_pids(active - keep, timeout=timeout)
 
 
 def _resolve_primary_daemon_pid() -> Optional[int]:
@@ -181,6 +266,15 @@ def _resolve_primary_daemon_pid() -> Optional[int]:
 
     pid_from_file = read_pid()
     active = _list_daemon_pids()
+    lock_pid = _read_lock_pid()
+
+    if lock_pid is not None and lock_pid in active:
+        if pid_from_file != lock_pid:
+            try:
+                _write_pid(lock_pid)
+            except OSError:
+                pass
+        return lock_pid
 
     if pid_from_file is not None and pid_from_file in active:
         return pid_from_file
@@ -475,6 +569,14 @@ def start_daemon(
     wait: float = 0.5,
 ) -> int:
     _cleanup_orphaned_daemons()
+    plain_start = (
+        video_path is None
+        and playback_speed is None
+        and volume is None
+        and blend_interpolation is None
+        and pause_on_fullscreen is None
+        and scale_mode is None
+    )
 
     if daemon_running():
         existing = read_pid()
@@ -485,24 +587,12 @@ def start_daemon(
             paused = daemon_paused()
             if (
                 paused
-                and video_path is None
-                and playback_speed is None
-                and volume is None
-                and blend_interpolation is None
-                and pause_on_fullscreen is None
-                and scale_mode is None
+                and plain_start
             ):
                 if resume_daemon():
                     return existing
 
-            if (
-                video_path is None
-                and playback_speed is None
-                and volume is None
-                and blend_interpolation is None
-                and pause_on_fullscreen is None
-                and scale_mode is None
-            ):
+            if plain_start:
                 health = daemon_health(alive=True, paused=paused)
                 if health.get("suspicious"):
                     return restart_daemon(
@@ -517,26 +607,12 @@ def start_daemon(
                     )
 
             # Plain "start" while already running should be a no-op.
-            if (
-                video_path is None
-                and playback_speed is None
-                and volume is None
-                and blend_interpolation is None
-                and pause_on_fullscreen is None
-                and scale_mode is None
-            ):
+            if plain_start:
                 return existing
 
-            return restart_daemon(
-                config_path=config_path,
-                video_path=video_path,
-                playback_speed=playback_speed,
-                volume=volume,
-                blend_interpolation=blend_interpolation,
-                pause_on_fullscreen=pause_on_fullscreen,
-                scale_mode=scale_mode,
-                wait=wait,
-            )
+            # Non-plain start is an explicit reconfiguration. Perform one
+            # deterministic stop before launch to avoid restart recursion.
+            stop_daemon(timeout=1.5)
 
     pid = _launch_daemon(
         config_path,
@@ -549,8 +625,22 @@ def start_daemon(
     )
     _write_pid(pid)
     _await_pid(pid, wait)
-    _cleanup_orphaned_daemons(keep={pid})
-    return pid
+    resolved = _resolve_primary_daemon_pid()
+    if resolved is None:
+        if _pid_is_alive(pid):
+            resolved = pid
+            try:
+                _write_pid(resolved)
+            except OSError:
+                pass
+        else:
+            raise RuntimeError("Failed to start AuraFlow daemon.")
+
+    keep = {resolved}
+    if _pid_is_alive(pid):
+        keep.add(pid)
+    _cleanup_orphaned_daemons(keep=keep)
+    return resolved
 
 
 def stop_daemon(timeout: float = 1.5) -> None:
@@ -560,14 +650,19 @@ def stop_daemon(timeout: float = 1.5) -> None:
     _LAST_LAUNCH_SIGNATURE = None
 
     pid = read_pid()
+    lock_pid = _read_lock_pid()
+    active = _list_daemon_pids()
     if pid is not None:
-        _terminate_pid(pid, timeout=timeout)
-    for path in (PID_PATH, DAEMON_PAUSED_PATH, DAEMON_COMMAND_PATH, DAEMON_HEALTH_PATH):
+        active.add(pid)
+    if lock_pid is not None:
+        active.add(lock_pid)
+    _terminate_pids(active, timeout=timeout)
+    for path in (PID_PATH, DAEMON_PAUSED_PATH, DAEMON_COMMAND_PATH, DAEMON_HEALTH_PATH, DAEMON_LOCK_PATH):
         try:
             path.unlink(missing_ok=True)
         except OSError:
             continue
-    _cleanup_orphaned_daemons()
+    _cleanup_orphaned_daemons(timeout=0.2)
     return
 
 

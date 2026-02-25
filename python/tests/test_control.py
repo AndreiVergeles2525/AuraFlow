@@ -44,6 +44,31 @@ class ControlCLITests(unittest.TestCase):
         start_daemon.assert_called_once()
         printer.assert_called()
 
+    def test_command_start_without_overrides_uses_resume_path(self):
+        args = Namespace(video=None, speed=None)
+        config = {
+            "video_path": "/tmp/video.mp4",
+            "playback_speed": 1.0,
+            "volume": 0.0,
+            "blend_interpolation": True,
+            "pause_on_fullscreen": True,
+            "scale_mode": "fill",
+        }
+        with mock.patch.object(control, "load_config", return_value=config):
+            with mock.patch.object(control, "start_daemon") as start_daemon:
+                with mock.patch.object(
+                    control,
+                    "build_status",
+                    return_value={"running": True, "config": config, "pid": 1, "autostart": False},
+                ):
+                    with mock.patch.object(control, "set_wallpaper_from_video") as set_wallpaper:
+                        with mock.patch("builtins.print") as printer:
+                            control.command_start(args)
+
+        start_daemon.assert_called_once_with(wait=0.35)
+        set_wallpaper.assert_not_called()
+        printer.assert_called_once()
+
     def test_command_stop_invokes_manager(self):
         args = Namespace()
         with mock.patch.object(control, "pause_daemon") as pause:
@@ -106,13 +131,23 @@ class ControlCLITests(unittest.TestCase):
 
     def test_command_clear_wallpaper_restores_previous(self):
         args = Namespace()
-        with mock.patch.object(control, "stop_daemon") as stop:
-            with mock.patch.object(control, "restore_wallpaper_backup", return_value=True) as restore:
+        call_order: list[str] = []
+        with mock.patch.object(
+            control,
+            "stop_daemon",
+            side_effect=lambda timeout=1.5: call_order.append("stop"),
+        ) as stop:
+            with mock.patch.object(
+                control,
+                "restore_wallpaper_backup",
+                side_effect=lambda **_kwargs: (call_order.append("restore"), True)[1],
+            ) as restore:
                 with mock.patch.object(control, "build_status", return_value={"running": False, "config": {}, "pid": None, "autostart": False}):
                     with mock.patch("builtins.print") as printer:
                         control.command_clear_wallpaper(args)
-        stop.assert_called_once()
-        restore.assert_called_once_with(delete_backup=False)
+        self.assertEqual(call_order[:2], ["restore", "stop"])
+        stop.assert_called_once_with(timeout=0.35)
+        restore.assert_called_once_with(delete_backup=False, allow_fallback=False)
         printer.assert_called_once()
 
     def test_command_set_interpolation_restarts_running_daemon(self):
