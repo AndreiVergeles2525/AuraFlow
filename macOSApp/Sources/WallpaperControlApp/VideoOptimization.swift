@@ -34,7 +34,7 @@ struct VideoOptimizationSettings: Codable {
         allowAV1PassthroughOnHardwareDecode: true,
         transcodeH264ToHEVC: true,
         forceSoftwareAV1Encode: false,
-        profile: .balanced
+        profile: .quality
     )
 
     enum CodingKeys: String, CodingKey {
@@ -134,8 +134,11 @@ final class VideoOptimizer {
     private let applicationSupportName = "AuraFlow"
     private let optimizedDirectoryName = "OptimizedVideos"
     private let av1CodecType: CMVideoCodecType = CMVideoCodecType(0x61763031) // 'av01'
+    private let vp9CodecType: CMVideoCodecType = CMVideoCodecType(0x76703039) // 'vp09'
+    private let vp8CodecType: CMVideoCodecType = CMVideoCodecType(0x76703038) // 'vp08'
     private let gifConversionRevision = 2
     private let softwareAV1Revision = 1
+    private let compatibilityTranscodeRevision = 1
 
     func optimizeIfNeeded(
         inputURL: URL,
@@ -166,13 +169,36 @@ final class VideoOptimizer {
         }
 
         let asset = AVURLAsset(url: inputURL)
-        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let tracks: [AVAssetTrack]
+        do {
+            tracks = try await asset.loadTracks(withMediaType: .video)
+        } catch {
+            if isCompatibilityFFmpegCandidate(inputURL) {
+                return try await transcodeToCompatibilityUsingFFmpeg(
+                    inputURL: inputURL,
+                    settings: settings,
+                    codecType: 0,
+                    reason: "Web container metadata unavailable. Converted with ffmpeg.",
+                    progress: progress
+                )
+            }
+            throw error
+        }
         guard let track = tracks.first else {
+            if isCompatibilityFFmpegCandidate(inputURL) {
+                return try await transcodeToCompatibilityUsingFFmpeg(
+                    inputURL: inputURL,
+                    settings: settings,
+                    codecType: 0,
+                    reason: "No readable video track. Converted with ffmpeg.",
+                    progress: progress
+                )
+            }
             throw VideoOptimizerError.noVideoTrack
         }
 
         let codecType = try await videoCodecType(for: track)
-        let decision = makeDecision(codecType: codecType, settings: settings)
+        let decision = makeDecision(inputURL: inputURL, codecType: codecType, settings: settings)
 
         switch decision {
         case .passthrough:
@@ -214,6 +240,15 @@ final class VideoOptimizer {
 
             let preset = exportPreset(for: asset, settings: settings)
             guard let exportSession = AVAssetExportSession(asset: asset, presetName: preset) else {
+                if isCompatibilityFFmpegCandidate(inputURL) {
+                    return try await transcodeToCompatibilityUsingFFmpeg(
+                        inputURL: inputURL,
+                        settings: settings,
+                        codecType: codecType,
+                        reason: "AVFoundation export unavailable. Converted with ffmpeg.",
+                        progress: progress
+                    )
+                }
                 throw VideoOptimizerError.exportUnavailable
             }
 
@@ -221,17 +256,35 @@ final class VideoOptimizer {
             exportSession.outputFileType = .mp4
             exportSession.shouldOptimizeForNetworkUse = false
 
-            try await export(session: exportSession, progress: progress)
+            do {
+                try await export(session: exportSession, progress: progress)
+            } catch {
+                if isCompatibilityFFmpegCandidate(inputURL) {
+                    return try await transcodeToCompatibilityUsingFFmpeg(
+                        inputURL: inputURL,
+                        settings: settings,
+                        codecType: codecType,
+                        reason: "AVFoundation export failed. Converted with ffmpeg.",
+                        progress: progress
+                    )
+                }
+                throw error
+            }
             return VideoOptimizationResult(outputURL: outputURL, decision: decision, fromCache: false)
         }
     }
 
     private func makeDecision(
+        inputURL: URL,
         codecType: CMVideoCodecType,
         settings: VideoOptimizationSettings
     ) -> VideoOptimizationDecision {
         guard settings.enabled else {
             return .passthrough(reason: "Optimization disabled.")
+        }
+
+        if isWebContainer(inputURL) || codecType == vp9CodecType || codecType == vp8CodecType {
+            return .transcode(reason: "Web video converted for macOS wallpaper compatibility.")
         }
 
         if shouldForceSoftwareAV1Encode(codecType: codecType, settings: settings) {
@@ -250,6 +303,55 @@ final class VideoOptimizer {
         }
 
         return .passthrough(reason: "Source codec already acceptable for playback.")
+    }
+
+    private func isWebContainer(_ inputURL: URL) -> Bool {
+        let ext = inputURL.pathExtension.lowercased()
+        return ext == "webm" || ext == "mkv"
+    }
+
+    private func isCompatibilityFFmpegCandidate(_ inputURL: URL) -> Bool {
+        isWebContainer(inputURL)
+    }
+
+    private func transcodeToCompatibilityUsingFFmpeg(
+        inputURL: URL,
+        settings: VideoOptimizationSettings,
+        codecType: CMVideoCodecType,
+        reason: String,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> VideoOptimizationResult {
+        guard let ffmpeg = resolveFFmpegExecutableForCompatibility() else {
+            throw VideoOptimizerError.exportFailed(
+                "This video requires ffmpeg conversion. Install ffmpeg (brew install ffmpeg) and retry."
+            )
+        }
+
+        let decision = VideoOptimizationDecision.transcode(reason: reason)
+        let outputURL = try optimizedOutputURL(
+            inputURL: inputURL,
+            settings: settings,
+            codecType: codecType,
+            kindTag: "video-compat-r\(compatibilityTranscodeRevision)"
+        )
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            progress(1.0)
+            return VideoOptimizationResult(outputURL: outputURL, decision: decision, fromCache: true)
+        }
+
+        let duration = try? await AVURLAsset(url: inputURL).load(.duration)
+        let seconds = duration.map(CMTimeGetSeconds)
+        let durationSeconds = (seconds?.isFinite == true) ? seconds : nil
+
+        try await transcodeToH264Compatibility(
+            ffmpegExecutable: ffmpeg,
+            inputURL: inputURL,
+            outputURL: outputURL,
+            settings: settings,
+            durationSeconds: durationSeconds,
+            progress: progress
+        )
+        return VideoOptimizationResult(outputURL: outputURL, decision: decision, fromCache: false)
     }
 
     func supportsHardwareAV1Decode() -> Bool {
@@ -277,8 +379,8 @@ final class VideoOptimizer {
             preferred = [AVAssetExportPresetHEVCHighestQuality, AVAssetExportPresetHighestQuality]
         case .balanced:
             preferred = [
-                AVAssetExportPresetHEVC1920x1080,
                 AVAssetExportPresetHEVCHighestQuality,
+                AVAssetExportPresetHEVC1920x1080,
                 AVAssetExportPresetHighestQuality,
             ]
         }
@@ -324,13 +426,15 @@ final class VideoOptimizer {
     }
 
     private func transcodeToAV1Software(
+        ffmpegExecutable: String? = nil,
         inputURL: URL,
         outputURL: URL,
         settings: VideoOptimizationSettings,
         durationSeconds: Double?,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws {
-        guard let ffmpeg = resolveFFmpegExecutable() else {
+        let resolvedFFmpeg = ffmpegExecutable ?? resolveFFmpegExecutableForAV1()
+        guard let ffmpeg = resolvedFFmpeg else {
             throw VideoOptimizerError.exportFailed(
                 "Force AV1 requires ffmpeg with libsvtav1/libaom-av1 (install via Homebrew)."
             )
@@ -347,6 +451,53 @@ final class VideoOptimizer {
             outputURL: outputURL,
             settings: settings
         )
+        try await runFFmpegProcess(
+            executable: ffmpeg,
+            arguments: arguments,
+            durationSeconds: durationSeconds,
+            failurePrefix: "AV1 software encode failed",
+            launchFailureMessage: "Unable to start ffmpeg for AV1 software encode.",
+            progress: progress
+        )
+    }
+
+    private func transcodeToH264Compatibility(
+        ffmpegExecutable: String,
+        inputURL: URL,
+        outputURL: URL,
+        settings: VideoOptimizationSettings,
+        durationSeconds: Double?,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? FileManager.default.removeItem(at: outputURL)
+
+        let arguments = ffmpegArgumentsForCompatibility(
+            inputURL: inputURL,
+            outputURL: outputURL,
+            settings: settings
+        )
+        try await runFFmpegProcess(
+            executable: ffmpegExecutable,
+            arguments: arguments,
+            durationSeconds: durationSeconds,
+            failurePrefix: "Compatibility transcode failed",
+            launchFailureMessage: "Unable to start ffmpeg for compatibility transcode.",
+            progress: progress
+        )
+    }
+
+    private func runFFmpegProcess(
+        executable: String,
+        arguments: [String],
+        durationSeconds: Double?,
+        failurePrefix: String,
+        launchFailureMessage: String,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws {
         let safeDuration = max(durationSeconds ?? 0, 0)
         final class StderrBufferState {
             let lock = NSLock()
@@ -357,7 +508,7 @@ final class VideoOptimizer {
         progress(0.0)
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: ffmpeg)
+            process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
 
             let stdoutPipe = Pipe()
@@ -411,8 +562,8 @@ final class VideoOptimizer {
                 let details = String(data: stderrTail, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let message = details.isEmpty
-                    ? "AV1 software encode failed."
-                    : "AV1 software encode failed: \(details)"
+                    ? "\(failurePrefix)."
+                    : "\(failurePrefix): \(details)"
                 continuation.resume(throwing: VideoOptimizerError.exportFailed(message))
             }
 
@@ -421,9 +572,7 @@ final class VideoOptimizer {
             } catch {
                 stderrPipe.fileHandleForReading.readabilityHandler = nil
                 continuation.resume(
-                    throwing: VideoOptimizerError.exportFailed(
-                        "Unable to start ffmpeg for AV1 software encode."
-                    )
+                    throwing: VideoOptimizerError.exportFailed(launchFailureMessage)
                 )
             }
         }
@@ -466,7 +615,43 @@ final class VideoOptimizer {
         return args
     }
 
-    private func resolveFFmpegExecutable() -> String? {
+    private func ffmpegArgumentsForCompatibility(
+        inputURL: URL,
+        outputURL: URL,
+        settings: VideoOptimizationSettings
+    ) -> [String] {
+        var args: [String] = [
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-progress",
+            "pipe:2",
+            "-i",
+            inputURL.path,
+            "-map_metadata",
+            "-1",
+            "-an",
+            "-sn",
+            "-dn",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+        ]
+
+        switch settings.profile {
+        case .quality:
+            args.append(contentsOf: ["-preset", "slow", "-crf", "17"])
+        case .balanced:
+            args.append(contentsOf: ["-preset", "medium", "-crf", "19"])
+        }
+
+        args.append(contentsOf: ["-movflags", "+faststart", "-f", "mp4", outputURL.path])
+        return args
+    }
+
+    private func ffmpegCandidateExecutables() -> [String] {
         let env = ProcessInfo.processInfo.environment["AURAFLOW_FFMPEG_PATH"] ?? ""
         var candidates: [String] = []
         if !env.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -480,7 +665,27 @@ final class VideoOptimizer {
         if let fromPath = resolveBinaryFromPATH("ffmpeg") {
             candidates.append(fromPath)
         }
+        return candidates
+    }
 
+    private func resolveFFmpegExecutableForCompatibility() -> String? {
+        let candidates = ffmpegCandidateExecutables()
+        var seen = Set<String>()
+        for candidate in candidates where !candidate.isEmpty {
+            if seen.contains(candidate) {
+                continue
+            }
+            seen.insert(candidate)
+            guard FileManager.default.isExecutableFile(atPath: candidate) else {
+                continue
+            }
+            return candidate
+        }
+        return nil
+    }
+
+    private func resolveFFmpegExecutableForAV1() -> String? {
+        let candidates = ffmpegCandidateExecutables()
         var seen = Set<String>()
         for candidate in candidates where !candidate.isEmpty {
             if seen.contains(candidate) {

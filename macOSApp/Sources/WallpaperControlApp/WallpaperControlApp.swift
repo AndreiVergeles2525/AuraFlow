@@ -1,10 +1,7 @@
 import AppKit
 import SwiftUI
-import Darwin
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let appSupportPath = WallpaperDesktopSupport.appSupportPath
-
     func applicationDidFinishLaunching(_ notification: Notification) {
         setenv("PYTHON_EXECUTABLE", "/usr/bin/python3", 1)
         NSApp.setActivationPolicy(.regular)
@@ -22,85 +19,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bringMainWindowToFront()
         return true
     }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        _ = WallpaperDesktopSupport.restoreFromBackupFiles(appSupportPath: appSupportPath)
-        forceStopDaemonProcesses()
-    }
-
-    private func forceStopDaemonProcesses() {
-        var pids = Set<Int32>()
-        if let pid = daemonPIDFromFile() {
-            pids.insert(pid)
-        }
-        pids.formUnion(findDaemonPIDsByProcessList())
-
-        for pid in pids where pid > 1 {
-            _ = Darwin.kill(pid, SIGTERM)
-        }
-
-        usleep(250_000)
-
-        for pid in pids where pid > 1 {
-            _ = Darwin.kill(pid, SIGKILL)
-        }
-
-        removeDaemonStateFiles()
-    }
-
-    private func daemonPIDFromFile() -> Int32? {
-        let pidPath = (appSupportPath as NSString).appendingPathComponent("daemon.pid")
-        guard let rawPID = try? String(contentsOfFile: pidPath, encoding: .utf8) else {
-            return nil
-        }
-        let trimmed = rawPID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let pid = Int32(trimmed), pid > 1 else {
-            return nil
-        }
-        return pid
-    }
-
-    private func findDaemonPIDsByProcessList() -> Set<Int32> {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        process.arguments = ["-f", "wallpaper_daemon.py"]
-
-        let outputPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-        } catch {
-            return []
-        }
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 else { return [] }
-        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
-
-        return Set(
-            output
-                .split(separator: "\n")
-                .compactMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                .filter { $0 > 1 }
-        )
-    }
-
-    private func removeDaemonStateFiles() {
-        let names = [
-            "daemon.pid",
-            "daemon.paused",
-            "daemon.command",
-            "daemon.health.json",
-        ]
-        for name in names {
-            let path = (appSupportPath as NSString).appendingPathComponent(name)
-            try? FileManager.default.removeItem(atPath: path)
-        }
-    }
-
 }
 
 @main

@@ -99,13 +99,13 @@ struct DaemonMetrics: Codable {
     var health: DaemonHealth? = nil
 }
 
-struct CatalogVideoSource: Hashable {
+struct CatalogVideoSource: Hashable, Codable {
     let url: URL
     let width: Int
     let height: Int
 }
 
-struct CatalogWallpaper: Identifiable, Hashable {
+struct CatalogWallpaper: Identifiable, Hashable, Codable {
     let id: String
     let title: String
     let category: String
@@ -193,6 +193,22 @@ struct CatalogWallpaper: Identifiable, Hashable {
             ]
         )
     ]
+}
+
+struct DownloadedCatalogWallpaper: Identifiable, Hashable, Codable {
+    let id: String
+    let wallpaperID: String
+    let title: String
+    let category: String
+    let attribution: String
+    let previewImageURL: URL?
+    let sourcePageURL: URL?
+    let localPath: String
+    let downloadedAt: Date
+
+    var localURL: URL {
+        URL(fileURLWithPath: localPath)
+    }
 }
 
 protocol PythonControlling {
@@ -334,13 +350,16 @@ final class AppViewModel: ObservableObject {
     @Published var alertMessage: String?
     @Published var previewPlayer: AVPlayer?
     @Published var isCatalogOpen: Bool = false
+    @Published var isDownloadedWallpapersOpen: Bool = false
     @Published var selectedCatalogWallpaper: CatalogWallpaper?
     @Published var catalogSearchText: String = ""
     @Published var catalogDownloadID: String?
-
-    let catalogWallpapers: [CatalogWallpaper] = CatalogWallpaper.defaultCatalog
+    @Published private(set) var catalogWallpapers: [CatalogWallpaper] = CatalogWallpaper.defaultCatalog
+    @Published private(set) var catalogIsRefreshing: Bool = false
+    @Published private(set) var downloadedCatalogWallpapers: [DownloadedCatalogWallpaper] = []
 
     private let controller: PythonControlling?
+    private let catalogProvider: WallpaperCatalogProviding
     private let optimizer = VideoOptimizer()
     private let optimizationStore: VideoOptimizationStore
     private var previewEndObserver: NSObjectProtocol?
@@ -354,6 +373,9 @@ final class AppViewModel: ObservableObject {
     private var monitoringTask: Task<Void, Never>?
     private var terminationObserver: NSObjectProtocol?
     private var isShuttingDown = false
+    private var catalogNavigationLockedUntil: Date = .distantPast
+    private var catalogRefreshTask: Task<Void, Never>?
+    private var lastCatalogRefreshAt: Date?
 
     private let expectedStatusContractVersion = 2
     private let bridgeFailureThreshold = 3
@@ -418,9 +440,11 @@ final class AppViewModel: ObservableObject {
 
     init(
         controller: PythonControlling? = nil,
-        optimizationStore: VideoOptimizationStore = VideoOptimizationStore()
+        optimizationStore: VideoOptimizationStore = VideoOptimizationStore(),
+        catalogProvider: WallpaperCatalogProviding = WallpaperWaifuCatalogProvider()
     ) {
         self.optimizationStore = optimizationStore
+        self.catalogProvider = catalogProvider
         if let controller {
             self.controller = controller
         } else {
@@ -442,12 +466,19 @@ final class AppViewModel: ObservableObject {
                 self?.beginShutdown()
             }
         }
+        Task { [weak self] in
+            await self?.loadCatalogFromCache()
+            await MainActor.run {
+                self?.loadDownloadedCatalogWallpapers()
+            }
+        }
         startHealthMonitor()
     }
 
     deinit {
         healthMonitorTask?.cancel()
         monitoringTask?.cancel()
+        catalogRefreshTask?.cancel()
         if let terminationObserver {
             NotificationCenter.default.removeObserver(terminationObserver)
         }
@@ -468,8 +499,18 @@ final class AppViewModel: ObservableObject {
         do {
             let status = try await runAsync { try controller.status() }
             apply(status: status)
+            let needsNormalizationURL = configuredVideoNeedingCompatibilityNormalization(from: status)
             recordBridgeSuccess()
             await startFromAutostartIfNeeded(using: status)
+            if let needsNormalizationURL {
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 120_000_000)
+                    await self?.applyVideoSelection(
+                        needsNormalizationURL,
+                        surfaceErrors: false
+                    )
+                }
+            }
             alertMessage = nil
         } catch {
             recordBridgeFailure(error, context: "status")
@@ -508,28 +549,68 @@ final class AppViewModel: ObservableObject {
     func openCatalog() {
         isSettingsOpen = false
         closeMonitoring()
+        closeDownloadedWallpapers()
         selectedCatalogWallpaper = nil
         isCatalogOpen = true
+        refreshCatalogIfNeeded()
     }
 
     func openCatalogFromMenuBar() {
         isSettingsOpen = false
         closeMonitoring()
+        closeDownloadedWallpapers()
         selectedCatalogWallpaper = nil
         isCatalogOpen = true
+        refreshCatalogIfNeeded()
+    }
+
+    func openDownloadedWallpapers() {
+        isCatalogOpen = false
+        selectedCatalogWallpaper = nil
+        closeSettings()
+        closeMonitoring()
+        loadDownloadedCatalogWallpapers()
+        isDownloadedWallpapersOpen = true
+    }
+
+    func closeDownloadedWallpapers() {
+        isDownloadedWallpapersOpen = false
+    }
+
+    func applyDownloadedCatalogWallpaper(_ wallpaper: DownloadedCatalogWallpaper) {
+        let localURL = wallpaper.localURL
+        guard FileManager.default.fileExists(atPath: localURL.path) else {
+            loadDownloadedCatalogWallpapers()
+            alertMessage = "Downloaded wallpaper file is missing. Re-download from catalog."
+            return
+        }
+
+        closeDownloadedWallpapers()
+        Task {
+            let previousPath = videoURL?.standardizedFileURL.path
+            await applyVideoSelection(localURL)
+            syncDownloadedCatalogWallpaperAfterApply(
+                wallpaperID: wallpaper.wallpaperID,
+                requestedURL: localURL,
+                previousVideoPath: previousPath
+            )
+        }
     }
 
     func openCatalogWallpaper(_ wallpaper: CatalogWallpaper) {
+        guard Date() >= catalogNavigationLockedUntil else { return }
         selectedCatalogWallpaper = wallpaper
     }
 
     func navigateBackFromCatalog() {
         if selectedCatalogWallpaper != nil {
             selectedCatalogWallpaper = nil
+            catalogNavigationLockedUntil = Date().addingTimeInterval(0.35)
             return
         }
         selectedCatalogWallpaper = nil
         isCatalogOpen = false
+        catalogNavigationLockedUntil = Date().addingTimeInterval(0.2)
     }
 
     func isDownloading(_ wallpaper: CatalogWallpaper) -> Bool {
@@ -544,8 +625,14 @@ final class AppViewModel: ObservableObject {
             defer { catalogDownloadID = nil }
             do {
                 let localURL = try await downloadCatalogVideo(for: wallpaper)
+                registerDownloadedCatalogWallpaper(for: wallpaper, localURL: localURL)
+                let previousPath = videoURL?.standardizedFileURL.path
                 await applyVideoSelection(localURL)
-                statusMessage = "Catalog wallpaper applied."
+                syncDownloadedCatalogWallpaperAfterApply(
+                    wallpaperID: wallpaper.id,
+                    requestedURL: localURL,
+                    previousVideoPath: previousPath
+                )
                 alertMessage = nil
             } catch {
                 alertMessage = "Failed to download wallpaper: \(error.localizedDescription)"
@@ -553,7 +640,7 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    func applyVideoSelection(_ url: URL) async {
+    func applyVideoSelection(_ url: URL, surfaceErrors: Bool = true) async {
         guard let controller else { return }
         guard !isBusy else { return }
         isBusy = true
@@ -563,15 +650,12 @@ final class AppViewModel: ObservableObject {
             let prepared = try await prepareVideoURLForPlayback(url)
             let status = try await runAsync { try controller.setVideo(prepared.url) }
             apply(status: status)
-            if let wallpaperPath = status.wallpaper {
-                _ = WallpaperDesktopSupport.applyToAllDesktops(imagePath: wallpaperPath)
-            }
             recordBridgeSuccess()
             statusMessage = prepared.summary ?? "Wallpaper source updated."
             alertMessage = nil
         } catch {
-            recordBridgeFailure(error, context: "set-video")
-            if bridgeFailureCount < bridgeFailureThreshold {
+            recordBridgeFailure(error, context: "set-video", surface: surfaceErrors)
+            if surfaceErrors && bridgeFailureCount < bridgeFailureThreshold {
                 alertMessage = "Failed to set video: \(error.localizedDescription)"
             }
         }
@@ -635,8 +719,7 @@ final class AppViewModel: ObservableObject {
             do {
                 let status = try await runAsync { try controller.clearWallpaper() }
                 apply(status: status)
-                let swiftRestored = WallpaperDesktopSupport.restoreFromBackupFiles()
-                let restored = (status.wallpaper_restored ?? false) || swiftRestored
+                let restored = status.wallpaper_restored ?? false
                 recordBridgeSuccess()
                 if restored {
                     statusMessage = "Original wallpaper restored."
@@ -804,6 +887,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func openSettings() {
+        closeDownloadedWallpapers()
         closeMonitoring()
         isSettingsOpen = true
     }
@@ -813,6 +897,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func openMonitoring() {
+        closeDownloadedWallpapers()
         closeSettings()
         isMonitoringOpen = true
         monitoringErrorMessage = nil
@@ -1049,27 +1134,148 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func downloadCatalogVideo(for wallpaper: CatalogWallpaper) async throws -> URL {
-        guard let source = preferredSource(for: wallpaper) else {
-            throw URLError(.badURL)
+    private func loadCatalogFromCache() async {
+        if let cached = await catalogProvider.loadCachedAnimeCatalog(), !cached.isEmpty {
+            catalogWallpapers = cached
+        }
+    }
+
+    private func loadDownloadedCatalogWallpapers() {
+        let loaded: [DownloadedCatalogWallpaper]
+        do {
+            let manifestURL = try downloadedCatalogManifestURL()
+            guard let data = try? Data(contentsOf: manifestURL) else {
+                let inferred = inferredDownloadedCatalogWallpapersFromDisk()
+                downloadedCatalogWallpapers = inferred
+                if !inferred.isEmpty {
+                    try? persistDownloadedCatalogWallpapers(inferred)
+                }
+                return
+            }
+            loaded = try JSONDecoder().decode([DownloadedCatalogWallpaper].self, from: data)
+        } catch {
+            downloadedCatalogWallpapers = inferredDownloadedCatalogWallpapersFromDisk()
+            return
         }
 
+        let existing = loaded.filter { item in
+            FileManager.default.fileExists(atPath: item.localURL.path)
+        }
+        var sorted = existing.sorted(by: { lhs, rhs in
+            lhs.downloadedAt > rhs.downloadedAt
+        })
+        if sorted.isEmpty {
+            sorted = inferredDownloadedCatalogWallpapersFromDisk()
+        }
+        downloadedCatalogWallpapers = sorted
+
+        if existing.count != loaded.count {
+            try? persistDownloadedCatalogWallpapers(sorted)
+        }
+    }
+
+    private func refreshCatalogIfNeeded(force: Bool = false) {
+        if catalogRefreshTask != nil {
+            return
+        }
+        if !force,
+           let lastCatalogRefreshAt,
+           Date().timeIntervalSince(lastCatalogRefreshAt) < 60 * 60 * 6 {
+            return
+        }
+
+        catalogRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            catalogIsRefreshing = true
+            defer {
+                catalogIsRefreshing = false
+                catalogRefreshTask = nil
+            }
+
+            do {
+                let fetched = try await catalogProvider.fetchAnimeCatalog()
+                guard !Task.isCancelled else { return }
+                guard !fetched.isEmpty else { return }
+                catalogWallpapers = fetched
+                if let selectedCatalogWallpaper {
+                    self.selectedCatalogWallpaper = fetched.first(where: { $0.id == selectedCatalogWallpaper.id })
+                }
+                lastCatalogRefreshAt = Date()
+            } catch {
+                if catalogWallpapers.isEmpty {
+                    catalogWallpapers = CatalogWallpaper.defaultCatalog
+                }
+                statusMessage = "Catalog sync failed. Showing built-in list."
+            }
+        }
+    }
+
+    private func downloadCatalogVideo(for wallpaper: CatalogWallpaper) async throws -> URL {
+        if let existing = downloadedCatalogWallpapers.first(where: { $0.wallpaperID == wallpaper.id }),
+           FileManager.default.fileExists(atPath: existing.localURL.path) {
+            return existing.localURL
+        }
+
+        let source = try await catalogSource(for: wallpaper)
+        let widthLabel = source.width > 0 ? String(source.width) : "auto"
+        let heightLabel = source.height > 0 ? String(source.height) : "auto"
         let destination = try catalogDirectoryURL().appendingPathComponent(
-            "\(wallpaper.id)-\(source.width)x\(source.height).mp4"
+            "\(wallpaper.id)-\(widthLabel)x\(heightLabel).\(downloadFileExtension(for: source.url))"
         )
         if FileManager.default.fileExists(atPath: destination.path) {
             return destination
         }
 
-        let (temporaryURL, response) = try await URLSession.shared.download(from: source.url)
+        var request = URLRequest(url: source.url)
+        request.timeoutInterval = 30
+        request.setValue("AuraFlow/1.1", forHTTPHeaderField: "User-Agent")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        if let sourcePageURL = wallpaper.sourcePageURL {
+            request.setValue(sourcePageURL.absoluteString, forHTTPHeaderField: "Referer")
+        }
+
+        let (temporaryURL, response) = try await URLSession.shared.download(for: request)
         if let httpResponse = response as? HTTPURLResponse,
            !(200...299).contains(httpResponse.statusCode) {
             throw URLError(.badServerResponse)
+        }
+        if !isLikelyCatalogVideoResponse(response: response, sourceURL: source.url) {
+            throw URLError(.cannotDecodeRawData)
         }
 
         try? FileManager.default.removeItem(at: destination)
         try FileManager.default.moveItem(at: temporaryURL, to: destination)
         return destination
+    }
+
+    private func catalogSource(for wallpaper: CatalogWallpaper) async throws -> CatalogVideoSource {
+        if let source = preferredSource(for: wallpaper) {
+            return source
+        }
+
+        let resolvedURL = try await catalogProvider.resolveDownloadURL(for: wallpaper)
+        return CatalogVideoSource(url: resolvedURL, width: 0, height: 0)
+    }
+
+    private func downloadFileExtension(for url: URL) -> String {
+        let ext = url.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ext.isEmpty {
+            return "mp4"
+        }
+        return ext
+    }
+
+    private func isLikelyCatalogVideoResponse(response: URLResponse, sourceURL: URL) -> Bool {
+        if let mime = response.mimeType?.lowercased() {
+            if mime.hasPrefix("video/") || mime == "application/octet-stream" || mime == "binary/octet-stream" {
+                return true
+            }
+            if mime.hasPrefix("text/") {
+                return false
+            }
+        }
+        let ext = sourceURL.pathExtension.lowercased()
+        return ["mp4", "webm", "mov", "m4v", "gif"].contains(ext)
     }
 
     private func preferredSource(for wallpaper: CatalogWallpaper) -> CatalogVideoSource? {
@@ -1107,6 +1313,152 @@ final class AppViewModel: ObservableObject {
             .appendingPathComponent("Catalog", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+
+    private func downloadedCatalogManifestURL() throws -> URL {
+        try catalogDirectoryURL().appendingPathComponent("downloaded-catalog.json")
+    }
+
+    private func registerDownloadedCatalogWallpaper(for wallpaper: CatalogWallpaper, localURL: URL) {
+        let normalizedPath = localURL.standardizedFileURL.path
+        var updated = downloadedCatalogWallpapers
+
+        let entry = DownloadedCatalogWallpaper(
+            id: wallpaper.id,
+            wallpaperID: wallpaper.id,
+            title: wallpaper.title,
+            category: wallpaper.category,
+            attribution: wallpaper.attribution,
+            previewImageURL: wallpaper.previewImageURL,
+            sourcePageURL: wallpaper.sourcePageURL,
+            localPath: normalizedPath,
+            downloadedAt: Date()
+        )
+
+        if let existingIndex = updated.firstIndex(where: { $0.id == entry.id || $0.localPath == entry.localPath }) {
+            updated[existingIndex] = entry
+        } else {
+            updated.append(entry)
+        }
+
+        updated.sort(by: { lhs, rhs in
+            lhs.downloadedAt > rhs.downloadedAt
+        })
+        downloadedCatalogWallpapers = updated
+        try? persistDownloadedCatalogWallpapers(updated)
+    }
+
+    private func persistDownloadedCatalogWallpapers(_ wallpapers: [DownloadedCatalogWallpaper]) throws {
+        let data = try JSONEncoder().encode(wallpapers)
+        try data.write(to: try downloadedCatalogManifestURL(), options: .atomic)
+    }
+
+    private func syncDownloadedCatalogWallpaperAfterApply(
+        wallpaperID: String,
+        requestedURL: URL,
+        previousVideoPath: String?
+    ) {
+        guard let appliedURL = videoURL?.standardizedFileURL else {
+            return
+        }
+        let appliedPath = appliedURL.path
+        if let previousVideoPath, previousVideoPath == appliedPath {
+            return
+        }
+
+        var updated = downloadedCatalogWallpapers
+        guard let index = updated.firstIndex(where: { $0.wallpaperID == wallpaperID }) else {
+            return
+        }
+
+        let normalizedRequestedPath = requestedURL.standardizedFileURL.path
+        let normalizedExistingPath = updated[index].localURL.standardizedFileURL.path
+        if normalizedExistingPath == appliedPath {
+            return
+        }
+
+        let normalizedPathToStore: String
+        if FileManager.default.fileExists(atPath: appliedPath) {
+            normalizedPathToStore = appliedPath
+        } else {
+            normalizedPathToStore = normalizedRequestedPath
+        }
+
+        let current = updated[index]
+        updated[index] = DownloadedCatalogWallpaper(
+            id: current.id,
+            wallpaperID: current.wallpaperID,
+            title: current.title,
+            category: current.category,
+            attribution: current.attribution,
+            previewImageURL: current.previewImageURL,
+            sourcePageURL: current.sourcePageURL,
+            localPath: normalizedPathToStore,
+            downloadedAt: current.downloadedAt
+        )
+        downloadedCatalogWallpapers = updated
+        try? persistDownloadedCatalogWallpapers(updated)
+    }
+
+    private func inferredDownloadedCatalogWallpapersFromDisk() -> [DownloadedCatalogWallpaper] {
+        guard let directory = try? catalogDirectoryURL() else {
+            return []
+        }
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        let validExtensions = Set(["mp4", "mov", "m4v", "webm", "gif"])
+        let ignoredNames: Set<String> = [
+            "waifu-anime-cache.json",
+            "waifu-download-links.json",
+            "downloaded-catalog.json",
+        ]
+
+        let mapped: [DownloadedCatalogWallpaper] = files.compactMap { fileURL in
+            let name = fileURL.lastPathComponent
+            guard !ignoredNames.contains(name) else { return nil }
+            let ext = fileURL.pathExtension.lowercased()
+            guard validExtensions.contains(ext) else { return nil }
+
+            let values = try? fileURL.resourceValues(forKeys: [.contentModificationDateKey])
+            let downloadedAt = values?.contentModificationDate ?? Date()
+            let fileName = fileURL.deletingPathExtension().lastPathComponent
+
+            return DownloadedCatalogWallpaper(
+                id: "local-\(fileName)",
+                wallpaperID: "local-\(fileName)",
+                title: inferredTitleFromDownloadedFileName(fileName),
+                category: "Downloaded",
+                attribution: "Catalog Cache",
+                previewImageURL: nil,
+                sourcePageURL: nil,
+                localPath: fileURL.standardizedFileURL.path,
+                downloadedAt: downloadedAt
+            )
+        }
+
+        return mapped.sorted(by: { lhs, rhs in
+            lhs.downloadedAt > rhs.downloadedAt
+        })
+    }
+
+    private func inferredTitleFromDownloadedFileName(_ fileName: String) -> String {
+        fileName
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: " ")
+            .map { part in
+                let word = String(part)
+                guard let first = word.first else { return word }
+                return first.uppercased() + word.dropFirst()
+            }
+            .joined(separator: " ")
     }
 
     private func configurePreview(for url: URL?) {
@@ -1251,6 +1603,17 @@ final class AppViewModel: ObservableObject {
             return "unknown issue"
         }
         return trimmed.replacingOccurrences(of: ",", with: ", ")
+    }
+
+    private func configuredVideoNeedingCompatibilityNormalization(from status: ControlStatus) -> URL? {
+        let path = status.config.video_path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return nil }
+        let url = URL(fileURLWithPath: path)
+        let ext = url.pathExtension.lowercased()
+        if ["webm", "mkv"].contains(ext) {
+            return url
+        }
+        return nil
     }
 
     private func beginShutdown() {
