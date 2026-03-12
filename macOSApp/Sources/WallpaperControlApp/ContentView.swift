@@ -18,22 +18,44 @@ struct ContentView: View {
     var body: some View {
         GeometryReader { proxy in
             let horizontalPadding: CGFloat = 24
-            let maxPanelWidth: CGFloat = viewModel.isCatalogOpen ? 1040 : 920
-            let panelWidth = max(560, min(proxy.size.width - (horizontalPadding * 2), maxPanelWidth))
+            let availableWidth = max(proxy.size.width - (horizontalPadding * 2), 0)
+            let availableHeight = max(proxy.size.height - 48, 0)
+            let controlPanelMaxWidth: CGFloat = 1440
+            let controlPanelWidth = min(availableWidth, controlPanelMaxWidth)
+            let catalogMaxWidth: CGFloat = 1040
+            let overlayWidth = viewModel.isCatalogOpen ? min(availableWidth, catalogMaxWidth) : controlPanelWidth
+            let isCompactBySize = controlPanelWidth < 1080 || availableHeight < 620
+            let isVeryCompactByHeight = availableHeight < 560
 
-            ZStack(alignment: .bottom) {
+            ZStack {
+                Color.clear
                 PreviewLayer(
                     player: viewModel.previewPlayer,
                     aspectRatio: aspectRatio,
                     scaleMode: viewModel.scaleMode
                 )
                     .ignoresSafeArea()
-
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .center)
+            .overlay(alignment: .top) {
+                if !viewModel.isCatalogOpen {
+                    SpeedOverlay(
+                        viewModel: viewModel,
+                        isAdjustingSpeed: $isAdjustingSpeed,
+                        availableWidth: availableWidth
+                    )
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, horizontalPadding)
+                    .padding(.top, 18)
+                    .opacity(controlsVisible ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.3), value: controlsVisible)
+                }
+            }
+            .overlay(alignment: .bottom) {
                 VStack(alignment: .leading, spacing: 12) {
                     if let alert = viewModel.alertMessage {
                         ErrorBanner(text: alert)
-                            .padding(.leading, 20)
-                            .padding(.bottom, 12)
                     }
 
                     if viewModel.isCatalogOpen {
@@ -41,7 +63,10 @@ struct ContentView: View {
                     } else {
                         ControlPanel(
                             viewModel: viewModel,
-                            isAdjustingSpeed: $isAdjustingSpeed
+                            isAdjustingSpeed: $isAdjustingSpeed,
+                            panelWidth: controlPanelWidth,
+                            isCompactBySize: isCompactBySize,
+                            isVeryCompactByHeight: isVeryCompactByHeight
                         )
                         .disabled(!viewModel.isControllerAvailable)
                         .overlay(
@@ -53,29 +78,24 @@ struct ContentView: View {
                         )
                     }
                 }
-                .frame(width: panelWidth, alignment: .leading)
+                .frame(width: overlayWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.horizontal, horizontalPadding)
                 .padding(.bottom, 24)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .opacity(controlsVisible ? 1 : 0)
                 .animation(.easeInOut(duration: 0.3), value: controlsVisible)
-
-                if !viewModel.isCatalogOpen {
-                    SpeedOverlay(viewModel: viewModel, isAdjustingSpeed: $isAdjustingSpeed)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                        .padding(.top, 18)
-                        .opacity(controlsVisible ? 1 : 0)
-                        .animation(.easeInOut(duration: 0.3), value: controlsVisible)
-                }
-
+            }
+            .overlay {
                 if viewModel.isSettingsOpen {
                     SettingsPopupOverlay(viewModel: viewModel)
                 }
-
+            }
+            .overlay {
                 if viewModel.isMonitoringOpen {
                     MonitoringPopupOverlay(viewModel: viewModel)
                 }
-
+            }
+            .overlay {
                 if viewModel.isDownloadedWallpapersOpen {
                     DownloadedWallpapersOverlay(viewModel: viewModel)
                 }
@@ -113,96 +133,182 @@ struct PreviewLayer: View {
 struct ControlPanel: View {
     @ObservedObject var viewModel: AppViewModel
     @Binding var isAdjustingSpeed: Bool
+    let panelWidth: CGFloat
+    let isCompactBySize: Bool
+    let isVeryCompactByHeight: Bool
     @Environment(\.colorScheme) private var colorScheme
 
+    private var widthScale: CGFloat {
+        max(0.76, min(1.0, panelWidth / 1180))
+    }
+
+    private var panelHorizontalInset: CGFloat {
+        isCompactBySize ? 18 : 22
+    }
+
+    private var panelVerticalInset: CGFloat {
+        isCompactBySize ? 12 : 14
+    }
+
+    private var rowSpacing: CGFloat {
+        isCompactBySize ? 10 : 12
+    }
+
+    private var primarySpacing: CGFloat {
+        isCompactBySize ? 8 : 12
+    }
+
+    private var secondarySpacing: CGFloat {
+        isCompactBySize ? 8 : 12
+    }
+
+    private var controlSize: ControlSize {
+        isCompactBySize ? .small : .regular
+    }
+
+    private var primaryButtonWidth: CGFloat {
+        scaledWidth(84, min: 70)
+    }
+
+    private var removeButtonWidth: CGFloat {
+        scaledWidth(146, min: 110)
+    }
+
+    private var catalogButtonWidth: CGFloat {
+        scaledWidth(156, min: 118)
+    }
+
+    private var downloadedButtonWidth: CGFloat {
+        scaledWidth(194, min: 144)
+    }
+
+    private var changeWallpaperButtonWidth: CGFloat {
+        scaledWidth(188, min: 148)
+    }
+
+    private var settingsButtonWidth: CGFloat {
+        scaledWidth(108, min: 84)
+    }
+
+    private var monitoringButtonWidth: CGFloat {
+        scaledWidth(138, min: 108)
+    }
+
+    private var rowContentWidth: CGFloat {
+        max(panelWidth - (panelHorizontalInset * 2), 0)
+    }
+
+    private var controlButtonsRowWidth: CGFloat {
+        (primaryButtonWidth * 2) + removeButtonWidth + (primarySpacing * 2)
+    }
+
+    private var actionButtonsRowWidth: CGFloat {
+        controlButtonsRowWidth + changeWallpaperButtonWidth
+    }
+
+    private var libraryButtonsRowWidth: CGFloat {
+        catalogButtonWidth + downloadedButtonWidth + primarySpacing
+    }
+
+    private var secondaryButtonsRowWidth: CGFloat {
+        settingsButtonWidth + monitoringButtonWidth + secondarySpacing
+    }
+
+    private var actionRowGap: CGFloat {
+        max(primarySpacing, rowContentWidth - actionButtonsRowWidth)
+    }
+
+    private var bottomRowGap: CGFloat {
+        max(secondarySpacing, rowContentWidth - secondaryButtonsRowWidth - libraryButtonsRowWidth)
+    }
+
+    private var showsStatusMessage: Bool {
+        !isVeryCompactByHeight && panelWidth >= 860
+    }
+
+    private var showsOptimizationProgress: Bool {
+        !isVeryCompactByHeight && panelWidth >= 820
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .center, spacing: 16) {
-                    videoInfo
-                    Spacer(minLength: 0)
-                    Button("Wallpaper Catalog") {
-                        viewModel.openCatalog()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!viewModel.canClearWallpaper)
+        VStack(alignment: .leading, spacing: rowSpacing) {
+            HStack(alignment: .top, spacing: 0) {
+                videoInfo
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-                    Button("Downloaded Wallpapers") {
-                        viewModel.openDownloadedWallpapers()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!viewModel.canClearWallpaper)
+            HStack(alignment: .center, spacing: 0) {
+                ControlButtons(
+                    viewModel: viewModel,
+                    spacing: primarySpacing,
+                    primaryButtonWidth: primaryButtonWidth,
+                    removeButtonWidth: removeButtonWidth
+                )
+                .frame(width: controlButtonsRowWidth, alignment: .leading)
 
-                    Button("Change Wallpaper…") {
-                        viewModel.chooseVideo()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!viewModel.canClearWallpaper)
+                Color.clear
+                    .frame(width: actionRowGap, height: 1)
+
+                changeWallpaperButton
+                    .frame(width: changeWallpaperButtonWidth)
+                    .layoutPriority(2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(alignment: .center, spacing: 0) {
+                HStack(alignment: .center, spacing: secondarySpacing) {
+                    settingsButton
+                        .frame(width: settingsButtonWidth)
+
+                    monitoringButton
+                        .frame(width: monitoringButtonWidth)
                 }
-                VStack(alignment: .leading, spacing: 10) {
-                    videoInfo
-                    HStack(spacing: 10) {
-                        Button("Wallpaper Catalog") {
-                            viewModel.openCatalog()
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!viewModel.canClearWallpaper)
+                .frame(width: secondaryButtonsRowWidth, alignment: .leading)
 
-                        Button("Downloaded Wallpapers") {
-                            viewModel.openDownloadedWallpapers()
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!viewModel.canClearWallpaper)
+                Color.clear
+                    .frame(width: bottomRowGap, height: 1)
 
-                        Button("Change Wallpaper…") {
-                            viewModel.chooseVideo()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(!viewModel.canClearWallpaper)
-                    }
+                HStack(alignment: .center, spacing: primarySpacing) {
+                    catalogButton
+                        .frame(width: catalogButtonWidth)
+                        .layoutPriority(2)
+
+                    downloadedWallpapersButton
+                        .frame(width: downloadedButtonWidth)
+                        .layoutPriority(2)
                 }
+                .frame(width: libraryButtonsRowWidth, alignment: .trailing)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if showsStatusMessage, let message = viewModel.statusMessage {
+                Text(message)
+                    .foregroundColor(.secondary)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            ControlButtons(viewModel: viewModel)
-
-            HStack(alignment: .center, spacing: 12) {
-                Button {
-                    viewModel.openSettings()
-                } label: {
-                    Label("Settings", systemImage: "slider.horizontal.3.circle.fill")
-                }
-                .buttonStyle(.bordered)
-                .disabled(viewModel.isBusy)
-
-                Button {
-                    viewModel.openMonitoring()
-                } label: {
-                    Label("Monitoring", systemImage: "gauge.with.dots.needle.67percent")
-                }
-                .buttonStyle(.bordered)
-                .disabled(!viewModel.canOpenMonitoring)
-
-                if let message = viewModel.statusMessage {
-                    Text(message)
-                        .foregroundColor(.secondary)
-                        .font(.caption)
-                }
-            }
-
-            if viewModel.optimizationInProgress {
+            if viewModel.optimizationInProgress && showsOptimizationProgress {
                 VStack(alignment: .leading, spacing: 6) {
                     if let label = viewModel.optimizationLabel {
                         Text(label)
                             .font(.caption)
                             .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
                     ProgressView(value: viewModel.optimizationProgress)
                         .progressViewStyle(.linear)
                 }
             }
         }
-        .padding(.vertical, 14)
-        .padding(.horizontal, 22)
+        .controlSize(controlSize)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.vertical, panelVerticalInset)
+        .padding(.horizontal, panelHorizontalInset)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             LiquidGlassView()
@@ -216,6 +322,80 @@ struct ControlPanel: View {
         .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.35 : 0.25), radius: 16, x: 0, y: 10)
     }
 
+    private var catalogButton: some View {
+        Button {
+            viewModel.openCatalog()
+        } label: {
+            Text("Wallpaper Catalog")
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.8)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .disabled(!viewModel.canClearWallpaper)
+    }
+
+    private var downloadedWallpapersButton: some View {
+        Button {
+            viewModel.openDownloadedWallpapers()
+        } label: {
+            Text("Downloaded Wallpapers")
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.78)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .disabled(!viewModel.canClearWallpaper)
+    }
+
+    private var changeWallpaperButton: some View {
+        Button {
+            viewModel.chooseVideo()
+        } label: {
+            Text("Change Wallpaper…")
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.82)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(!viewModel.canClearWallpaper)
+    }
+
+    private var settingsButton: some View {
+        Button {
+            viewModel.openSettings()
+        } label: {
+            Label("Settings", systemImage: "slider.horizontal.3.circle.fill")
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.82)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .disabled(viewModel.isBusy)
+    }
+
+    private var monitoringButton: some View {
+        Button {
+            viewModel.openMonitoring()
+        } label: {
+            Label("Monitoring", systemImage: "gauge.with.dots.needle.67percent")
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.82)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .disabled(!viewModel.canOpenMonitoring)
+    }
+
+    private func scaledWidth(_ base: CGFloat, min minWidth: CGFloat) -> CGFloat {
+        max(minWidth, base * widthScale)
+    }
+
     private var videoInfo: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Video")
@@ -226,6 +406,7 @@ struct ControlPanel: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
+        .layoutPriority(0)
     }
 }
 
@@ -661,22 +842,18 @@ struct DownloadedWallpapersCard: View {
 
 struct ControlButtons: View {
     @ObservedObject var viewModel: AppViewModel
+    let spacing: CGFloat
+    let primaryButtonWidth: CGFloat
+    let removeButtonWidth: CGFloat
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 12) {
-                startButton
-                stopButton
-                clearButton
-                Spacer(minLength: 0)
-            }
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    startButton
-                    stopButton
-                }
-                clearButton
-            }
+        HStack(spacing: spacing) {
+            startButton
+                .frame(width: primaryButtonWidth)
+            stopButton
+                .frame(width: primaryButtonWidth)
+            clearButton
+                .frame(width: removeButtonWidth)
         }
     }
 
@@ -685,7 +862,10 @@ struct ControlButtons: View {
             viewModel.start()
         } label: {
             Label("Start", systemImage: "desktopcomputer")
-                .frame(minWidth: 96)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.82)
+                .frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
         .disabled(!viewModel.canStart)
@@ -696,7 +876,10 @@ struct ControlButtons: View {
             viewModel.stop()
         } label: {
             Label("Stop", systemImage: "stop.circle")
-                .frame(minWidth: 96)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.82)
+                .frame(maxWidth: .infinity)
         }
         .buttonStyle(.bordered)
         .disabled(!viewModel.canStop)
@@ -707,7 +890,10 @@ struct ControlButtons: View {
             viewModel.clearWallpaper()
         } label: {
             Label("Remove Wallpaper", systemImage: "photo.slash")
-                .frame(minWidth: 140)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.78)
+                .frame(maxWidth: .infinity)
         }
         .buttonStyle(.bordered)
         .disabled(!viewModel.canClearWallpaper)
@@ -972,13 +1158,24 @@ final class CatalogPreviewImageLoader: ObservableObject {
 struct SpeedOverlay: View {
     @ObservedObject var viewModel: AppViewModel
     @Binding var isAdjustingSpeed: Bool
+    let availableWidth: CGFloat
     @Environment(\.colorScheme) private var colorScheme
+
+    private var pillWidth: CGFloat {
+        min(max(availableWidth * 0.46, 420), 720)
+    }
+
+    private var compactControlSize: ControlSize {
+        availableWidth < 900 ? .small : .regular
+    }
 
     var body: some View {
         HStack(spacing: 14) {
             Label("Speed", systemImage: "speedometer")
                 .labelStyle(.titleAndIcon)
                 .foregroundStyle(.primary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
 
             Slider(
                 value: Binding(
@@ -994,14 +1191,18 @@ struct SpeedOverlay: View {
                     }
                 }
             )
-            .frame(width: 220)
+            .frame(maxWidth: .infinity)
 
             Text(String(format: "%.2fx", viewModel.playbackSpeed))
                 .monospacedDigit()
                 .foregroundColor(.secondary)
+                .lineLimit(1)
+                .frame(minWidth: 64, alignment: .trailing)
         }
+        .controlSize(compactControlSize)
         .padding(.vertical, 10)
         .padding(.horizontal, 16)
+        .frame(width: pillWidth)
         .background(
             LiquidGlassView()
                 .clipShape(Capsule())
@@ -1173,53 +1374,14 @@ struct LiquidGlassView: NSViewRepresentable {
     var material: MaterialStyle = .regular
 
     func makeNSView(context: Context) -> NSView {
-        if let glass = createGlassView() {
-            return glass
-        }
         let fallback = LiquidGlassFallbackView()
         fallback.glassStyle = material
         return fallback
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        if let fallback = nsView as? LiquidGlassFallbackView {
-            fallback.glassStyle = material
-        } else {
-            configureGlassLayer(for: nsView)
-        }
-    }
-
-    private func createGlassView() -> NSView? {
-        guard let glassClass = NSClassFromString("NSGlassEffectView") as? NSObject.Type else {
-            return nil
-        }
-        let instance = glassClass.init()
-        guard let view = instance as? NSView else {
-            return nil
-        }
-        configureGlassLayer(for: view)
-        return view
-    }
-
-    private func configureGlassLayer(for view: NSView) {
-        view.wantsLayer = true
-        if view.layer == nil {
-            view.layer = CALayer()
-        }
-        view.layer?.cornerRadius = 14
-        view.layer?.masksToBounds = true
-        view.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(material == .clear ? 0.18 : 0.28).cgColor
-        let materialSelector = NSSelectorFromString("setMaterial:")
-        if view.responds(to: materialSelector) {
-            let value = material == .regular ? 0 : 1
-            view.perform(materialSelector, with: NSNumber(value: value))
-        }
-        let blendingSelector = NSSelectorFromString("setBlendingMode:")
-        if view.responds(to: blendingSelector) {
-            // 1 == behindWindow on most modern macOS versions
-            view.perform(blendingSelector, with: NSNumber(value: 1))
-        }
-        LiquidGlassFallbackView.applyOverlays(to: view.layer!, style: material)
+        guard let fallback = nsView as? LiquidGlassFallbackView else { return }
+        fallback.glassStyle = material
     }
 }
 
