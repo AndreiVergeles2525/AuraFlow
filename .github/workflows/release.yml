@@ -29,6 +29,10 @@ jobs:
 
       - name: Build app bundle and archives
         shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+          CLANG_MODULE_CACHE_PATH: /tmp/auraflow-clang-module-cache
+          PYTHON_BUILD_PYTHON: /usr/bin/python3
         run: ./build_app.sh
 
       - name: Publish GitHub release
