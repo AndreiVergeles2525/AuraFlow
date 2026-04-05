@@ -1,66 +1,166 @@
 # AuraFlow for macOS
 
 <p align="center">
-  <img src="docs/aura-ui.png" width="760" alt="AuraFlow UI preview" />
+  <img src="docs/aura-ui.png" width="900" alt="AuraFlow interface preview" />
 </p>
 
-AuraFlow — живые обои для macOS: демон на Python + PyObjC и SwiftUI-интерфейс на AppKit. Панель управления скрывается при бездействии, позволяет выбирать видео, задавать скорость проигрывания и управлять автозапуском.
+AuraFlow is a live wallpaper app for macOS. It lets you play video wallpapers on the desktop, browse and download wallpapers from the built-in catalog, control playback in real time, and restore the user's previous non-AuraFlow wallpaper when live playback is removed.
 
-## 🚀 Установка
+## What You Can Do
 
-| Способ | Для кого | Что делать |
-| --- | --- | --- |
-| **Готовый DMG** | macOS на Apple Silicon (arm64) и Intel (x86_64) | Скачайте `dist/AuraFlow.dmg`, откройте образ и перетащите `AuraFlow.app` в `/Applications`. |
-| **Сборка из исходников** | Разработчикам | Запустите `PYTHON_BUILD_PYTHON=/usr/bin/python3 ./build_app.sh`. В каталоге `dist/` появятся `AuraFlow.app`, `AuraFlow.zip` и `AuraFlow.dmg`. |
+- Apply your own local video as a live wallpaper.
+- Preview a wallpaper before starting playback.
+- Browse the built-in wallpaper catalog and download wallpapers directly inside the app.
+- Reopen wallpapers from the downloaded library without downloading them again.
+- Change playback speed from the floating speed control.
+- Choose how the wallpaper fits the screen with `Fill`, `Fit`, or `Stretch`.
+- Pause playback automatically when a fullscreen app is active.
+- Launch AuraFlow at login.
+- Optimize videos for playback compatibility on macOS.
+- Monitor the wallpaper daemon from the built-in monitoring panel.
+- Remove the live wallpaper and restore the user's latest non-AuraFlow wallpaper.
 
-*DMG содержит универсальный бинарник (arm64+x86_64), поэтому работает на обоих типах процессоров.*
+## Main Features
 
-## Архитектура
-- `python/` – демон `wallpaper_daemon.py`, CLI `control.py`, вспомогательные модули и тесты.
-- `macOSApp/` – Swift Package с GUI (SwiftUI + AppKit) и мостом `PythonBridge`.
-- `scripts/build_release.sh` / `build_app.sh` – сборка `.app`, упаковка зависимостей, создание `.zip` и `.dmg`.
+### Live Wallpaper Playback
+AuraFlow runs a desktop wallpaper daemon built with Python and PyObjC. It creates one wallpaper window per display, plays the selected video in a loop, and keeps playback settings in sync with the SwiftUI control app.
 
-## Возможности интерфейса
-- Клиентская декорация окна, полупрозрачный blur-интерфейс.
-- Предпросмотр видео и мгновенная установка первого кадра в качестве системных обоев.
-- Управление скоростью (0.25× – 2×), кнопки запуска/остановки, автозапуск через LaunchAgent.
+### Built-In Wallpaper Catalog
+AuraFlow includes an integrated catalog for browsing live wallpapers. Users can open a wallpaper detail view, preview it, download it, apply it, and reopen the source page when needed.
 
-## Сборка `.app`
+### Downloaded Wallpapers Library
+Downloaded wallpapers are stored locally and shown inside the app, so users can quickly switch between previously downloaded wallpapers without repeating the download flow.
 
-### Быстрая локальная сборка (arm64)
+### Playback Controls
+Users can:
+
+- start and stop live playback;
+- change playback speed;
+- switch scale mode;
+- enable or disable blend interpolation;
+- pause automatically for fullscreen apps;
+- enable launch at login.
+
+### Video Optimization
+AuraFlow can optimize videos for better macOS playback compatibility. Depending on the source codec and the Mac's hardware capabilities, the app can keep the source video, transcode it, or use optional ffmpeg-based conversion paths.
+
+### Wallpaper Restore Logic
+When AuraFlow starts, it saves the user's current non-AuraFlow wallpaper state. When the user removes the live wallpaper, AuraFlow restores that previous wallpaper instead of leaving a frozen AuraFlow frame behind.
+
+## System Requirements
+
+- macOS 13 or later
+- Apple Silicon or Intel Mac
+- Internet connection for wallpaper catalog downloads
+
+Optional:
+
+- `ffmpeg` for some advanced video conversion paths
+- macOS 26 or later for the Liquid Glass visual effect
+
+## Install
+
+### Download a Release
+
+1. Download the latest `AuraFlow.dmg` from GitHub Releases.
+2. Open the DMG.
+3. Drag `AuraFlow.app` into `/Applications`.
+4. Launch the app.
+
+### Build from Source
+
 ```bash
-cd /Users/prplx/AuraFlow
-BUILD_UNIVERSAL=0 PYTHON_BUILD_PYTHON=/usr/bin/python3 ./build_app.sh
+PYTHON_BUILD_PYTHON=/usr/bin/python3 ./build_app.sh
 ```
 
-### Universal сборка (arm64 + x86_64)
+The build output is created in `dist/`:
+
+- `dist/AuraFlow.app`
+- `dist/AuraFlow.zip`
+- `dist/AuraFlow.dmg`
+
+## First Launch
+
+On first use, macOS may ask for permission to let AuraFlow control desktop wallpaper-related system actions. If wallpaper restore or desktop updates do not work correctly, check the app's Automation permissions in System Settings.
+
+## Usage
+
+### Use Your Own Wallpaper
+
+1. Open AuraFlow.
+2. Click `Change Wallpaper...`.
+3. Select a local video.
+4. Preview it.
+5. Press `Start`.
+
+### Use the Wallpaper Catalog
+
+1. Open `Wallpaper Catalog`.
+2. Choose a wallpaper.
+3. Click `Download & Apply` or download it and reopen it later from `Downloaded Wallpapers`.
+
+### Restore the Previous Wallpaper
+
+- Press `Remove`.
+
+AuraFlow will stop playback and restore the user's latest non-AuraFlow wallpaper snapshot.
+
+## Playback Settings
+
+AuraFlow includes settings for:
+
+- Launch at Login
+- Auto-Pause on Fullscreen Apps
+- Blend Interpolation
+- Scale Algorithm
+- Video Optimization
+- Optimization Profile
+
+The exact behavior of AV1 and HEVC optimization depends on the Mac's hardware decode support.
+
+## Project Structure
+
+- `macOSApp/` — SwiftUI/AppKit desktop app and Python bridge
+- `python/` — wallpaper daemon, control CLI, wallpaper utilities, and tests
+- `scripts/build_release.sh` — release build and packaging script
+- `docs/` — documentation assets
+
+## Development
+
+### Run Tests
+
+Python:
+
 ```bash
-cd /Users/prplx/AuraFlow
+python3 -m unittest discover -s python/tests
+```
+
+Swift:
+
+```bash
+cd macOSApp
+swift test
+```
+
+### Build a Universal App
+
+```bash
 BUILD_UNIVERSAL=1 PYTHON_BUILD_PYTHON=/usr/bin/python3 ./build_app.sh
 ```
 
-Примечания:
-- Для universal-сборки может понадобиться Rosetta (`arch -x86_64 ...`).
-- В `dist/` всегда формируются `.app`, `.zip` и `.dmg`.
-- Python-зависимости (PyObjC) вендорятся внутрь `.app` автоматически.
-- Базовый запуск не требует Homebrew-зависимостей.
-- `ffmpeg` нужен только для режимов, где включено software AV1-encoding.
+## Troubleshooting
 
-## Тестирование
-- Python: `python3 -m unittest discover -s python/tests`
-- Swift: `cd macOSApp && swift test`
+### The build looks stuck after Swift finishes
+The packaging step installs vendored Python dependencies. That can take time and is expected.
 
-## Настройка автозапуска
-```bash
-python3 python/control.py set-autostart on
-```
-Создаётся LaunchAgent `~/Library/LaunchAgents/com.example.auraflow.plist`.
+### Some conversions are unavailable
+Certain conversion paths require `ffmpeg`. If `ffmpeg` is not installed, AuraFlow will still work for normal playback and many compatibility paths, but not all optional conversions.
 
-## Диагностика
-- Логи демона – `~/Library/Application Support/AuraFlow/daemon.log`
-- PID-файл – `~/Library/Application Support/AuraFlow/daemon.pid`
-- Конфигурация – `~/Library/Application Support/AuraFlow/config.json`
+### Liquid Glass is missing
+Liquid Glass is only available on macOS 26 or later. Older macOS versions use the fallback interface.
 
-## Troubleshooting сборки
-- Если после `Build complete!` кажется, что сборка "зависла", обычно это шаг `Vendoring Python dependencies` (`pip install`). Это нормально и может занять время.
-- Если скрипт пишет `Another build is already running`, удалите lock-файл: `rm -rf /Users/prplx/AuraFlow/.build-lock`.
+## License
+
+This project is open source under the MIT License.
+
+Copyright (c) 2026 mkkitsune

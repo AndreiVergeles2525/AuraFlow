@@ -1,6 +1,7 @@
 import AppKit
 
 let auraFlowMainWindowIdentifier = NSUserInterfaceItemIdentifier("AuraFlowMainWindow")
+private var auraFlowStoredWindowFrames: [ObjectIdentifier: NSRect] = [:]
 
 func configureWindowForClientDecorations(_ window: NSWindow) {
     window.identifier = auraFlowMainWindowIdentifier
@@ -16,9 +17,35 @@ func configureWindowForClientDecorations(_ window: NSWindow) {
     window.isMovableByWindowBackground = false
     window.isOpaque = false
     window.backgroundColor = .clear
-    window.standardWindowButton(.closeButton)?.isHidden = false
-    window.standardWindowButton(.miniaturizeButton)?.isHidden = false
-    window.standardWindowButton(.zoomButton)?.isHidden = false
+    applyStandardWindowButtonAppearance(for: window)
+}
+
+func applyStandardWindowButtonAppearance(for window: NSWindow) {
+    let buttonColors: [(NSWindow.ButtonType, NSColor)] = [
+        (.closeButton, NSColor(srgbRed: 1.0, green: 95.0 / 255.0, blue: 87.0 / 255.0, alpha: 1.0)),
+        (.miniaturizeButton, NSColor(srgbRed: 1.0, green: 189.0 / 255.0, blue: 46.0 / 255.0, alpha: 1.0)),
+        (.zoomButton, NSColor(srgbRed: 40.0 / 255.0, green: 205.0 / 255.0, blue: 65.0 / 255.0, alpha: 1.0))
+    ]
+    for (buttonType, color) in buttonColors {
+        guard let button = window.standardWindowButton(buttonType) else { continue }
+        button.isHidden = false
+        button.alphaValue = 1.0
+        button.wantsLayer = true
+        button.isBordered = false
+        button.image = nil
+        button.alternateImage = nil
+        button.contentTintColor = .clear
+        button.bezelColor = .clear
+        button.layer?.shadowOpacity = 0
+        button.layer?.backgroundColor = color.cgColor
+        button.layer?.cornerRadius = max(button.bounds.height * 0.5, 0)
+        button.layer?.masksToBounds = true
+        button.layer?.borderWidth = 0
+        if #available(macOS 10.14, *) {
+            button.appearance = NSAppearance(named: .aqua)
+        }
+        button.needsDisplay = true
+    }
 }
 
 func mainScreenAspectRatio() -> CGFloat {
@@ -49,4 +76,24 @@ func bringMainWindowToFront() {
 
     window.makeKeyAndOrderFront(nil)
     window.orderFrontRegardless()
+}
+
+func toggleFastWindowZoom(_ window: NSWindow) {
+    let windowID = ObjectIdentifier(window)
+    let targetFrame: NSRect
+
+    if let restoredFrame = auraFlowStoredWindowFrames.removeValue(forKey: windowID) {
+        targetFrame = restoredFrame
+    } else {
+        let currentFrame = window.frame
+        let targetVisibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame ?? currentFrame
+        let needsZoom = !currentFrame.equalTo(targetVisibleFrame)
+
+        guard needsZoom else { return }
+
+        auraFlowStoredWindowFrames[windowID] = currentFrame
+        targetFrame = targetVisibleFrame
+    }
+
+    window.setFrame(targetFrame, display: false, animate: true)
 }

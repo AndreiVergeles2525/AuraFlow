@@ -16,30 +16,70 @@ class WallpaperUtilsTests(unittest.TestCase):
         with mock.patch.object(
             wallpaper_utils,
             "_run_osascript",
-            side_effect=[
-                SimpleNamespace(returncode=0, stdout=""),
-                SimpleNamespace(returncode=0, stdout="ok\n"),
-            ],
+            return_value=SimpleNamespace(returncode=0, stdout="ok\n"),
         ) as run_osascript:
             applied = wallpaper_utils._set_all_desktops_picture_via_system_events("/tmp/frame.png")
 
         self.assertTrue(applied)
-        self.assertGreaterEqual(run_osascript.call_count, 2)
+        run_osascript.assert_called_once()
 
     def test_set_all_desktops_picture_via_system_events_retries_on_mismatch(self):
         with mock.patch.object(
             wallpaper_utils,
             "_run_osascript",
             side_effect=[
-                SimpleNamespace(returncode=0, stdout=""),
                 SimpleNamespace(returncode=0, stdout="mismatch\n"),
-                SimpleNamespace(returncode=0, stdout=""),
                 SimpleNamespace(returncode=0, stdout="ok\n"),
             ],
         ):
             applied = wallpaper_utils._set_all_desktops_picture_via_system_events("/tmp/frame.png")
 
         self.assertTrue(applied)
+
+    def test_set_desktop_picture_paths_via_system_events_retries_on_mismatch(self):
+        with mock.patch.object(
+            wallpaper_utils,
+            "_run_osascript",
+            side_effect=[
+                SimpleNamespace(returncode=0, stdout="mismatch\n"),
+                SimpleNamespace(returncode=0, stdout="ok\n"),
+            ],
+        ) as run_osascript:
+            applied = wallpaper_utils._set_desktop_picture_paths_via_system_events(
+                ["/tmp/one.heic", "/tmp/two.heic"]
+            )
+
+        self.assertTrue(applied)
+        self.assertEqual(run_osascript.call_count, 2)
+
+    def test_save_wallpaper_store_backup_copies_current_index(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            store_index_path = temp_root / "Index.plist"
+            store_backup_path = temp_root / "wallpaper_store_backup.plist"
+            store_index_path.write_bytes(b"plist-data")
+
+            with mock.patch.object(wallpaper_utils, "SYSTEM_WALLPAPER_INDEX_PATH", store_index_path):
+                with mock.patch.object(wallpaper_utils, "WALLPAPER_STORE_BACKUP_PATH", store_backup_path):
+                    wallpaper_utils._save_wallpaper_store_backup_if_needed()
+
+            self.assertEqual(store_backup_path.read_bytes(), b"plist-data")
+
+    def test_restore_wallpaper_store_backup_copies_index_and_reloads_services(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            store_index_path = temp_root / "Index.plist"
+            store_backup_path = temp_root / "wallpaper_store_backup.plist"
+            store_backup_path.write_bytes(b"backup-plist")
+
+            with mock.patch.object(wallpaper_utils, "SYSTEM_WALLPAPER_INDEX_PATH", store_index_path):
+                with mock.patch.object(wallpaper_utils, "WALLPAPER_STORE_BACKUP_PATH", store_backup_path):
+                    with mock.patch.object(wallpaper_utils, "_reload_wallpaper_services") as reload_services:
+                        restored = wallpaper_utils._restore_wallpaper_store_backup()
+
+            self.assertTrue(restored)
+            self.assertEqual(store_index_path.read_bytes(), b"backup-plist")
+            reload_services.assert_called_once()
 
     def test_validate_video_checks_existence(self):
         with tempfile.NamedTemporaryFile() as handle:
@@ -54,13 +94,29 @@ class WallpaperUtilsTests(unittest.TestCase):
         temp_path = Path("/tmp/fake.png")
         with mock.patch.object(wallpaper_utils, "extract_first_frame", return_value=fake_image) as extract:
             with mock.patch.object(wallpaper_utils, "save_image_to_temp", return_value=temp_path) as save_image:
-                with mock.patch.object(wallpaper_utils, "set_wallpaper") as set_wallpaper:
+                with mock.patch.object(wallpaper_utils, "_commit_managed_frame", return_value=temp_path) as commit:
                     result = wallpaper_utils.set_wallpaper_from_video(Path("/tmp/video.mp4"))
 
         extract.assert_called_once()
         save_image.assert_called_once_with(fake_image)
-        set_wallpaper.assert_called_once_with(temp_path)
+        commit.assert_called_once_with(temp_path, apply_wallpaper=True)
         self.assertEqual(result, temp_path)
+
+    def test_commit_managed_frame_applies_unique_destination_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            destination = temp_root / "last_frame_123.png"
+            destination.write_bytes(b"frame")
+
+            with mock.patch.object(wallpaper_utils, "_sync_last_frame_alias") as sync_alias:
+                with mock.patch.object(wallpaper_utils, "_cleanup_old_managed_frames") as cleanup:
+                    with mock.patch.object(wallpaper_utils, "set_wallpaper") as set_wallpaper:
+                        result = wallpaper_utils._commit_managed_frame(destination, apply_wallpaper=True)
+
+        sync_alias.assert_called_once_with(destination)
+        cleanup.assert_called_once_with(destination)
+        set_wallpaper.assert_called_once_with(destination)
+        self.assertEqual(result, destination)
 
     def test_set_wallpaper_from_video_uses_ffmpeg_fallback_when_extract_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -75,11 +131,15 @@ class WallpaperUtilsTests(unittest.TestCase):
                         "_extract_first_frame_with_ffmpeg",
                         return_value=last_frame,
                     ) as extract_with_ffmpeg:
-                        with mock.patch.object(wallpaper_utils, "set_wallpaper") as set_wallpaper:
+                        with mock.patch.object(
+                            wallpaper_utils,
+                            "_commit_managed_frame",
+                            return_value=last_frame,
+                        ) as commit:
                             result = wallpaper_utils.set_wallpaper_from_video(Path("/tmp/video.webm"))
 
         extract_with_ffmpeg.assert_called_once_with(Path("/tmp/video.webm"))
-        set_wallpaper.assert_called_once_with(last_frame)
+        commit.assert_called_once_with(last_frame, apply_wallpaper=True)
         self.assertEqual(result, last_frame)
 
     def test_set_wallpaper_from_video_falls_back_to_current_wallpaper_path(self):
@@ -194,12 +254,11 @@ class WallpaperUtilsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             backup_path = temp_root / "wallpaper_backup.json"
-            original_backup_path = temp_root / "wallpaper_backup_original.json"
             backup_path.write_text('{"1":"/tmp/old.heic"}', encoding="utf-8")
 
             with mock.patch.object(wallpaper_utils, "WALLPAPER_BACKUP_PATH", backup_path):
-                with mock.patch.object(wallpaper_utils, "WALLPAPER_ORIGINAL_BACKUP_PATH", original_backup_path):
-                    with mock.patch.object(wallpaper_utils, "ensure_app_support_dir"):
+                with mock.patch.object(wallpaper_utils, "ensure_app_support_dir"):
+                    with mock.patch.object(wallpaper_utils, "_save_wallpaper_store_backup_if_needed"):
                         with mock.patch.object(
                             wallpaper_utils,
                             "_current_wallpapers",
@@ -216,9 +275,63 @@ class WallpaperUtilsTests(unittest.TestCase):
                 backup_path.read_text(encoding="utf-8").strip(),
                 '{\n  "1": "/tmp/new.heic"\n}',
             )
+
+    def test_save_wallpaper_backup_skips_store_backup_for_managed_wallpaper(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            backup_path = temp_root / "wallpaper_backup.json"
+            managed_path = temp_root / "last_frame.png"
+            managed_path.write_bytes(b"frame")
+
+            with mock.patch.object(wallpaper_utils, "WALLPAPER_BACKUP_PATH", backup_path):
+                with mock.patch.object(wallpaper_utils, "ensure_app_support_dir"):
+                    with mock.patch.object(
+                        wallpaper_utils,
+                        "_save_wallpaper_store_backup_if_needed",
+                    ) as save_store_backup:
+                        with mock.patch.object(
+                            wallpaper_utils,
+                            "_current_wallpapers",
+                            return_value={"1": str(managed_path)},
+                        ):
+                            with mock.patch.object(
+                                wallpaper_utils,
+                                "_is_managed_wallpaper",
+                                return_value=True,
+                            ):
+                                wallpaper_utils._save_wallpaper_backup_if_needed()
+
+            save_store_backup.assert_not_called()
+            self.assertFalse(backup_path.exists())
+
+    def test_save_wallpaper_backup_prefers_current_visible_wallpaper_over_spaces_consensus(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            backup_path = temp_root / "wallpaper_backup.json"
+
+            with mock.patch.object(wallpaper_utils, "WALLPAPER_BACKUP_PATH", backup_path):
+                with mock.patch.object(wallpaper_utils, "ensure_app_support_dir"):
+                    with mock.patch.object(wallpaper_utils, "_save_wallpaper_store_backup_if_needed"):
+                        with mock.patch.object(
+                            wallpaper_utils,
+                            "_desktop_picture_paths_via_system_events",
+                            return_value=["/tmp/latest.heic", "/tmp/latest.heic", "/tmp/older.heic"],
+                        ):
+                            with mock.patch.object(
+                                wallpaper_utils,
+                                "_current_wallpapers",
+                                return_value={"1": "/tmp/older.heic"},
+                            ):
+                                with mock.patch.object(
+                                    wallpaper_utils,
+                                    "_is_managed_wallpaper",
+                                    return_value=False,
+                                ):
+                                    wallpaper_utils._save_wallpaper_backup_if_needed()
+
             self.assertEqual(
-                original_backup_path.read_text(encoding="utf-8").strip(),
-                '{\n  "1": "/tmp/new.heic"\n}',
+                backup_path.read_text(encoding="utf-8").strip(),
+                '{\n  "1": "/tmp/older.heic"\n}',
             )
 
     def test_load_wallpaper_backup_ignores_managed_last_frame(self):
@@ -329,7 +442,7 @@ class WallpaperUtilsTests(unittest.TestCase):
             self.assertTrue(restored)
             self.assertTrue(backup_path.exists())
 
-    def test_restore_wallpaper_backup_skips_system_events_when_not_needed(self):
+    def test_restore_wallpaper_backup_syncs_all_desktops_for_single_target(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             image_path = temp_root / "wallpaper.heic"
@@ -367,7 +480,7 @@ class WallpaperUtilsTests(unittest.TestCase):
                                         restored = wallpaper_utils.restore_wallpaper_backup()
 
             self.assertTrue(restored)
-            sync_spaces.assert_not_called()
+            sync_spaces.assert_called_once_with(str(image_path))
 
     def test_restore_wallpaper_backup_waits_briefly_before_system_events(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -408,48 +521,33 @@ class WallpaperUtilsTests(unittest.TestCase):
                                             restored = wallpaper_utils.restore_wallpaper_backup()
 
             self.assertTrue(restored)
-            sync_spaces.assert_not_called()
+            sync_spaces.assert_called_once_with(str(image_path))
 
-    def test_restore_wallpaper_uses_original_backup_when_current_invalid(self):
+    def test_restore_wallpaper_backup_prefers_store_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             backup_path = temp_root / "wallpaper_backup.json"
-            original_backup_path = temp_root / "wallpaper_backup_original.json"
-            image_path = temp_root / "wallpaper.heic"
-            image_path.write_bytes(b"image")
-            last_frame_path = temp_root / "last_frame.png"
-            last_frame_path.write_bytes(b"frame")
-
-            backup_path.write_text(json.dumps({"1": str(last_frame_path)}), encoding="utf-8")
-            original_backup_path.write_text(json.dumps({"1": str(image_path)}), encoding="utf-8")
-
-            fake_screen = object()
-            fake_workspace = mock.Mock()
-
-            fake_appkit = mock.Mock()
-            fake_appkit.NSWorkspace.sharedWorkspace.return_value = fake_workspace
-            fake_appkit.NSScreen.screens.return_value = [fake_screen]
-
-            fake_nsurl = mock.Mock()
-            fake_nsurl.fileURLWithPath_.side_effect = lambda path: path
+            backup_path.write_text('{"1":"/tmp/fallback.heic"}', encoding="utf-8")
+            store_backup_path = temp_root / "wallpaper_store_backup.plist"
+            store_backup_path.write_bytes(b"plist")
 
             with mock.patch.object(wallpaper_utils, "WALLPAPER_BACKUP_PATH", backup_path):
-                with mock.patch.object(wallpaper_utils, "WALLPAPER_ORIGINAL_BACKUP_PATH", original_backup_path):
-                    with mock.patch.object(wallpaper_utils, "LAST_FRAME_PATH", last_frame_path):
-                        with mock.patch.object(wallpaper_utils, "_require_macos_frameworks"):
-                            with mock.patch.object(wallpaper_utils, "_screen_identifier", return_value="1"):
-                                with mock.patch.object(wallpaper_utils, "AppKit", fake_appkit):
-                                    with mock.patch.object(wallpaper_utils, "NSURL", fake_nsurl):
-                                        with mock.patch.object(
-                                            wallpaper_utils,
-                                            "_set_all_desktops_picture_via_system_events",
-                                            return_value=True,
-                                        ):
-                                            restored = wallpaper_utils.restore_wallpaper_backup()
+                with mock.patch.object(wallpaper_utils, "WALLPAPER_STORE_BACKUP_PATH", store_backup_path):
+                    with mock.patch.object(wallpaper_utils, "_require_macos_frameworks"):
+                        with mock.patch.object(
+                            wallpaper_utils,
+                            "_restore_wallpaper_store_backup",
+                            return_value=True,
+                        ) as restore_store:
+                            with mock.patch.object(
+                                wallpaper_utils,
+                                "_restore_wallpaper_paths",
+                            ) as restore_paths:
+                                restored = wallpaper_utils.restore_wallpaper_backup()
 
             self.assertTrue(restored)
-            fake_workspace.setDesktopImageURL_forScreen_options_error_.assert_called_once()
-
+            restore_store.assert_called_once()
+            restore_paths.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

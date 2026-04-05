@@ -37,11 +37,13 @@ from paths import (
     DAEMON_COMMAND_PATH,
     DAEMON_HEALTH_PATH,
     DAEMON_LOCK_PATH,
+    DAEMON_NO_FREEZE_PATH,
     DAEMON_PAUSED_PATH,
     LAST_FRAME_PATH,
     ensure_app_support_dir,
     PID_PATH,
 )
+from wallpaper_utils import refresh_wallpaper_backup
 
 SCALE_MODE_TO_GRAVITY = {
     "fill": AVFoundation.AVLayerVideoGravityResizeAspectFill,
@@ -50,6 +52,12 @@ SCALE_MODE_TO_GRAVITY = {
 }
 DEFAULT_SCALE_MODE = "fill"
 _DAEMON_LOCK_HANDLE = None
+FRAME_CHECKPOINT_INTERVAL_SECONDS = 20.0
+PLAYBACK_PROGRESS_EPSILON_SECONDS = 0.02
+PLAYBACK_LOOP_RESET_TOLERANCE_SECONDS = 0.5
+PLAYBACK_STALL_GRACE_SECONDS = 2.5
+SLEEP_WAKE_GAP_THRESHOLD_SECONDS = 5.0
+WALLPAPER_BACKUP_REFRESH_INTERVAL_SECONDS = 30.0
 
 
 def _managed_frame_suffix() -> str:
@@ -100,6 +108,27 @@ def _cleanup_old_managed_frames(keep: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+def _apply_last_frame_alias_if_available() -> bool:
+    try:
+        alias = LAST_FRAME_PATH.expanduser().resolve(strict=False)
+    except OSError:
+        return False
+    if not alias.exists() or not alias.is_file():
+        return False
+    try:
+        _apply_wallpaper_to_all_desktops(alias)
+    except Exception:
+        return False
+    return True
+
+
+def _commit_managed_frame(destination: Path, apply_wallpaper: bool = True) -> None:
+    _sync_last_frame_alias(destination)
+    _cleanup_old_managed_frames(destination)
+    if apply_wallpaper:
+        _apply_wallpaper_to_all_desktops(destination)
+
+
 def _run_osascript(script: str):
     try:
         return subprocess.run(  # noqa: S603
@@ -132,6 +161,15 @@ def _apply_wallpaper_to_all_desktops(frame_path: Path) -> None:
     _set_all_desktops_picture_via_system_events(
         str(frame_path.expanduser().resolve(strict=False))
     )
+
+
+def _recover_delegate_playback_after_interactive_transition(delegate) -> None:
+    controller = getattr(delegate, "controller", None)
+    if controller is None:
+        return
+    controller.refreshDesktopPresentation(force_rebuild=True)
+    controller.ensurePlaybackIsActive()
+    delegate.lastPlaybackPollMonotonic = time.monotonic()
 
 
 @dataclass
@@ -211,6 +249,7 @@ class AuraFlowController(NSObject):
         self._blend_interpolation_active = False
         self._blend_filter_error = ""
         self._blend_previous_image = None
+        self._blend_filter = None
         self._blend_lock = threading.Lock()
         self._blend_strength = 0.72
         self._blend_target_fps = 18.0
@@ -222,10 +261,142 @@ class AuraFlowController(NSObject):
         self._consecutive_stall_polls = 0
         self._last_recovery_reason = ""
         self._last_recovery_at = 0.0
+        self._last_frame_checkpoint_at = 0.0
+        self._last_progress_time_seconds = None
+        self._last_progress_monotonic = 0.0
 
         self._player = AVFoundation.AVPlayer.alloc().init()
         self._apply_config(config)
         return self
+
+    def _clear_player_item_observers(self):
+        center = NSNotificationCenter.defaultCenter()
+        remove_named_observer = getattr(center, "removeObserver_name_object_", None)
+        if remove_named_observer is not None:
+            try:
+                remove_named_observer(
+                    self,
+                    AVFoundation.AVPlayerItemDidPlayToEndTimeNotification,
+                    None,
+                )
+                return
+            except Exception:
+                pass
+        center.removeObserver_(self)
+
+    def _build_player_item(self, config: DaemonConfig):
+        url = config.video_url
+        asset = AVFoundation.AVURLAsset.URLAssetWithURL_options_(
+            url,
+            {AVFoundation.AVURLAssetPreferPreciseDurationAndTimingKey: True},
+        )
+        player_item = AVFoundation.AVPlayerItem.playerItemWithAsset_(asset)
+        try:
+            player_item.setPreferredForwardBufferDuration_(0.35)
+        except Exception:
+            pass
+        self._configure_blend_interpolation(player_item, asset, config.blend_interpolation)
+        return player_item
+
+    def _replace_player_item(self, config: DaemonConfig, seek_time=None):
+        player_item = self._build_player_item(config)
+        self._clear_player_item_observers()
+        self._player.replaceCurrentItemWithPlayerItem_(player_item)
+        NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            self,
+            "playerItemDidReachEnd:",
+            AVFoundation.AVPlayerItemDidPlayToEndTimeNotification,
+            player_item,
+        )
+        self._player.setActionAtItemEnd_(AVFoundation.AVPlayerActionAtItemEndNone)
+        self._player.setAutomaticallyWaitsToMinimizeStalling_(False)
+        self._player.setVolume_(max(0.0, min(config.volume, 1.0)))
+        if seek_time is not None:
+            try:
+                self._player.seekToTime_toleranceBefore_toleranceAfter_(
+                    seek_time,
+                    CoreMedia.kCMTimeZero,
+                    CoreMedia.kCMTimeZero,
+                )
+            except Exception:
+                pass
+        return player_item
+
+    def _current_playback_time(self):
+        if self._player is None:
+            return None
+        try:
+            current_time = self._player.currentTime()
+            seconds = float(CoreMedia.CMTimeGetSeconds(current_time))
+        except Exception:
+            return None
+        if seconds != seconds or seconds < 0:
+            return None
+        return current_time
+
+    def _current_playback_seconds(self):
+        if self._player is None:
+            return None
+        try:
+            current_time = self._player.currentTime()
+            seconds = float(CoreMedia.CMTimeGetSeconds(current_time))
+        except Exception:
+            return None
+        if seconds != seconds or seconds < 0:
+            return None
+        return seconds
+
+    def _reset_playback_progress_tracking(self):
+        self._last_progress_time_seconds = None
+        self._last_progress_monotonic = 0.0
+
+    def _record_playback_progress(self, current_seconds: float | None, now: float) -> bool:
+        if current_seconds is None:
+            return False
+
+        previous_seconds = self._last_progress_time_seconds
+        if previous_seconds is None:
+            self._last_progress_time_seconds = current_seconds
+            self._last_progress_monotonic = now
+            return True
+
+        moved_forward = (
+            current_seconds - previous_seconds
+        ) > PLAYBACK_PROGRESS_EPSILON_SECONDS
+        looped_or_seeked = (
+            previous_seconds - current_seconds
+        ) > PLAYBACK_LOOP_RESET_TOLERANCE_SECONDS
+
+        if moved_forward or looped_or_seeked:
+            self._last_progress_time_seconds = current_seconds
+            self._last_progress_monotonic = now
+            return True
+
+        return False
+
+    def _player_item_failed(self, player_item) -> bool:
+        if player_item is None:
+            return False
+        try:
+            status = int(player_item.status())
+        except Exception:
+            return False
+        failed_status = getattr(AVFoundation, "AVPlayerItemStatusFailed", None)
+        return failed_status is not None and status == int(failed_status)
+
+    def _play_at_configured_rate(self):
+        if self._player is None:
+            return
+        target_rate = max(0.1, self._config.playback_speed)
+        play_immediately = getattr(self._player, "playImmediatelyAtRate_", None)
+        if play_immediately is not None:
+            try:
+                play_immediately(target_rate)
+                return
+            except Exception:
+                pass
+        self._player.play()
+        self._player.setRate_(target_rate)
 
     def _apply_config(self, config: DaemonConfig):
         """Create player items and windows for the provided config."""
@@ -235,36 +406,14 @@ class AuraFlowController(NSObject):
         self._auto_paused_for_low_power = False
         self._auto_paused_for_fullscreen = False
         self._fullscreen_app_detected = False
-        url = config.video_url
-        asset = AVFoundation.AVURLAsset.URLAssetWithURL_options_(
-            url,
-            {AVFoundation.AVURLAssetPreferPreciseDurationAndTimingKey: True},
-        )
-        player_item = AVFoundation.AVPlayerItem.playerItemWithAsset_(asset)
-        try:
-            player_item.setPreferredForwardBufferDuration_(2.0)
-        except Exception:
-            pass
-
-        NSNotificationCenter.defaultCenter().removeObserver_(self)
-        self._player.replaceCurrentItemWithPlayerItem_(player_item)
-        NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
-            self,
-            "playerItemDidReachEnd:",
-            AVFoundation.AVPlayerItemDidPlayToEndTimeNotification,
-            player_item,
-        )
-
-        self._player.setActionAtItemEnd_(AVFoundation.AVPlayerActionAtItemEndNone)
-        self._player.setAutomaticallyWaitsToMinimizeStalling_(False)
-        self._player.setVolume_(max(0.0, min(config.volume, 1.0)))
-        self._configure_blend_interpolation(player_item, asset, config.blend_interpolation)
-
+        self._last_frame_checkpoint_at = 0.0
+        self._reset_playback_progress_tracking()
+        self._replace_player_item(config)
         self._teardown_windows()
         self._setup_windows()
 
-        self._player.play()
-        self._player.setRate_(max(0.1, config.playback_speed))
+        self._play_at_configured_rate()
+        self._checkpoint_current_frame_as_wallpaper(apply_wallpaper=False)
 
     def _configure_blend_interpolation(
         self,
@@ -276,6 +425,7 @@ class AuraFlowController(NSObject):
         self._blend_interpolation_active = False
         self._blend_filter_error = ""
         self._blend_previous_image = None
+        self._blend_filter = None
         self._blend_last_composition_time = -1.0
         self._blend_last_monotonic = 0.0
 
@@ -377,11 +527,13 @@ class AuraFlowController(NSObject):
         except Exception:
             previous_cropped = previous_image
 
-        dissolve = None
-        try:
-            dissolve = Quartz.CIFilter.filterWithName_("CIDissolveTransition")
-        except Exception:
-            dissolve = None
+        dissolve = self._blend_filter
+        if dissolve is None:
+            try:
+                dissolve = Quartz.CIFilter.filterWithName_("CIDissolveTransition")
+            except Exception:
+                dissolve = None
+            self._blend_filter = dissolve
         if dissolve is None:
             return None
 
@@ -411,8 +563,15 @@ class AuraFlowController(NSObject):
         """Recover from transient AVPlayer stalls without changing UI state."""
 
         if self._player is None or self._is_paused:
+            self._reset_playback_progress_tracking()
             self._consecutive_stall_polls = 0
             return
+
+        screen_count = len(AppKit.NSScreen.screens())
+        if len(self._windows) != screen_count:
+            self._last_recovery_reason = "window_layout_refresh"
+            self._last_recovery_at = time.time()
+            self.refreshDesktopPresentation(force_rebuild=True)
 
         try:
             rate = float(self._player.rate())
@@ -426,11 +585,51 @@ class AuraFlowController(NSObject):
             self._consecutive_stall_polls += 1
             self._last_recovery_reason = "missing_item"
             self._last_recovery_at = time.time()
-            self._apply_config(self._config)
+            self._replace_player_item(
+                self._config,
+                seek_time=self._current_playback_time(),
+            )
+            self._play_at_configured_rate()
             return
 
+        if self._player_item_failed(current_item):
+            self._stall_events += 1
+            self._recovery_events += 1
+            self._consecutive_stall_polls += 1
+            self._last_recovery_reason = "failed_item"
+            self._last_recovery_at = time.time()
+            self._replace_player_item(
+                self._config,
+                seek_time=self._current_playback_time(),
+            )
+            self._play_at_configured_rate()
+            return
+
+        current_seconds = self._current_playback_seconds()
+        now = time.monotonic()
         if rate > 0.01:
-            self._consecutive_stall_polls = 0
+            progressed = self._record_playback_progress(current_seconds, now)
+            if (
+                progressed
+                or self._last_progress_monotonic <= 0
+                or (now - self._last_progress_monotonic) < PLAYBACK_STALL_GRACE_SECONDS
+            ):
+                self._consecutive_stall_polls = 0
+                return
+
+            self._stall_events += 1
+            self._recovery_events += 1
+            self._consecutive_stall_polls += 1
+            self._last_recovery_reason = "time_stuck"
+            self._last_recovery_at = time.time()
+            if self._consecutive_stall_polls >= 2:
+                self._last_recovery_reason = "time_stuck_rebuild"
+                self._replace_player_item(
+                    self._config,
+                    seek_time=self._current_playback_time(),
+                )
+                self._reset_playback_progress_tracking()
+            self._play_at_configured_rate()
             return
 
         self._stall_events += 1
@@ -438,8 +637,13 @@ class AuraFlowController(NSObject):
         self._consecutive_stall_polls += 1
         self._last_recovery_reason = "zero_rate"
         self._last_recovery_at = time.time()
-        self._player.play()
-        self._player.setRate_(max(0.1, self._config.playback_speed))
+        if self._consecutive_stall_polls >= 2:
+            self._last_recovery_reason = "zero_rate_rebuild"
+            self._replace_player_item(
+                self._config,
+                seek_time=self._current_playback_time(),
+            )
+        self._play_at_configured_rate()
 
     def healthSnapshot(self):
         """Expose daemon health details for CLI/Swift monitoring."""
@@ -452,9 +656,8 @@ class AuraFlowController(NSObject):
         except Exception:
             rate = 0.0
 
-        has_item = bool(
-            self._player is not None and self._player.currentItem() is not None
-        )
+        current_item = self._player.currentItem() if self._player is not None else None
+        has_item = bool(current_item is not None)
 
         reasons = []
         if self._player is None:
@@ -470,6 +673,16 @@ class AuraFlowController(NSObject):
             and self._consecutive_stall_polls >= 3
         ):
             reasons.append("rate_stuck")
+        if (
+            not self._is_paused
+            and has_item
+            and rate > 0.01
+            and self._last_progress_monotonic > 0
+            and (time.monotonic() - self._last_progress_monotonic) >= PLAYBACK_STALL_GRACE_SECONDS
+        ):
+            reasons.append("time_stuck")
+        if not self._is_paused and self._player_item_failed(current_item):
+            reasons.append("item_failed")
         if self._blend_interpolation_enabled and not self._blend_interpolation_active:
             reasons.append("blend_unavailable")
         if self._blend_filter_error:
@@ -505,6 +718,70 @@ class AuraFlowController(NSObject):
 
         self._config = config
         self._apply_config(config)
+
+    def prepareForSessionTransition(self):
+        """Persist the current frame before sleep/lock hides wallpaper windows."""
+
+        if self._player is None:
+            return
+        self._persist_current_frame_as_wallpaper(apply_wallpaper=True)
+
+    def refreshDesktopPresentation(self, force_rebuild: bool = False):
+        """Re-attach wallpaper windows after wake/unlock without resetting state."""
+
+        if self._player is None:
+            return
+
+        screen_count = len(AppKit.NSScreen.screens())
+        should_rebuild = force_rebuild or len(self._windows) != screen_count
+
+        if should_rebuild:
+            self._teardown_windows()
+            self._setup_windows()
+        else:
+            desktop_level = Quartz.CGWindowLevelForKey(Quartz.kCGDesktopWindowLevelKey)
+            for window in self._windows:
+                try:
+                    window.setLevel_(desktop_level)
+                    window.orderBack_(None)
+                    window.orderFrontRegardless()
+                except Exception:
+                    pass
+
+        if self._player.currentItem() is None:
+            self._replace_player_item(self._config)
+        elif self._manual_paused:
+            self._persist_current_frame_as_wallpaper()
+            return
+        elif self._player_item_failed(self._player.currentItem()):
+            self._replace_player_item(
+                self._config,
+                seek_time=self._current_playback_time(),
+            )
+
+        self._is_paused = False
+        self._auto_paused_for_low_power = False
+        self._auto_paused_for_fullscreen = False
+        self._reset_playback_progress_tracking()
+        self._play_at_configured_rate()
+
+    def checkpointWallpaperFrameIfNeeded(self):
+        """Refresh the stable last-frame checkpoint while playback is active."""
+
+        if self._player is None or self._is_paused:
+            return
+
+        now = time.monotonic()
+        if (
+            self._last_frame_checkpoint_at > 0
+            and (now - self._last_frame_checkpoint_at) < FRAME_CHECKPOINT_INTERVAL_SECONDS
+        ):
+            return
+
+        self._checkpoint_current_frame_as_wallpaper(
+            apply_wallpaper=False,
+            checkpoint_time=now,
+        )
 
     def _setup_windows(self):
         """Create one wallpaper window per screen."""
@@ -582,6 +859,8 @@ class AuraFlowController(NSObject):
             return
 
         NSNotificationCenter.defaultCenter().removeObserver_(self)
+        self._blend_previous_image = None
+        self._blend_filter = None
         self._player.pause()
         self._player.replaceCurrentItemWithPlayerItem_(None)
         self._teardown_windows()
@@ -592,12 +871,13 @@ class AuraFlowController(NSObject):
 
         if self._player is None:
             return
-        self._persist_current_frame_as_wallpaper()
+        self._player.pause()
+        self._persist_current_frame_as_wallpaper(apply_wallpaper=True)
+        self._reset_playback_progress_tracking()
         self._manual_paused = True
         self._auto_paused_for_low_power = False
         self._auto_paused_for_fullscreen = False
         self._is_paused = True
-        self._player.pause()
 
     def resume(self):
         """Resume playback after pause."""
@@ -617,8 +897,8 @@ class AuraFlowController(NSObject):
         self._is_paused = False
         self._auto_paused_for_low_power = False
         self._auto_paused_for_fullscreen = False
-        self._player.play()
-        self._player.setRate_(max(0.1, self._config.playback_speed))
+        self._reset_playback_progress_tracking()
+        self._play_at_configured_rate()
 
     def enforcePlaybackPolicies(self):
         """
@@ -654,8 +934,8 @@ class AuraFlowController(NSObject):
             self._is_paused = False
             self._auto_paused_for_low_power = False
             self._auto_paused_for_fullscreen = False
-            self._player.play()
-            self._player.setRate_(max(0.1, self._config.playback_speed))
+            self._reset_playback_progress_tracking()
+            self._play_at_configured_rate()
 
     def _is_fullscreen_app_active(self) -> bool:
         """
@@ -752,26 +1032,40 @@ class AuraFlowController(NSObject):
         except Exception:
             return False
 
-    def _persist_current_frame_as_wallpaper(self):
+    def _checkpoint_current_frame_as_wallpaper(
+        self,
+        apply_wallpaper: bool = False,
+        checkpoint_time: float | None = None,
+    ) -> bool:
+        if not self._persist_current_frame_as_wallpaper(apply_wallpaper=apply_wallpaper):
+            return False
+        self._last_frame_checkpoint_at = (
+            checkpoint_time if checkpoint_time is not None else time.monotonic()
+        )
+        return True
+
+    def _persist_current_frame_as_wallpaper(self, apply_wallpaper: bool = True) -> bool:
         if self._player is None:
-            return
+            return False
 
         current_item = self._player.currentItem()
         if current_item is None:
-            return
+            return _apply_last_frame_alias_if_available() if apply_wallpaper else False
 
         asset = current_item.asset()
         if asset is None:
-            return
+            return _apply_last_frame_alias_if_available() if apply_wallpaper else False
 
         try:
             generator = AVFoundation.AVAssetImageGenerator.assetImageGeneratorWithAsset_(asset)
             generator.setAppliesPreferredTrackTransform_(True)
+            generator.setRequestedTimeToleranceBefore_(CoreMedia.kCMTimeZero)
+            generator.setRequestedTimeToleranceAfter_(CoreMedia.kCMTimeZero)
             current_time = self._player.currentTime()
             result = generator.copyCGImageAtTime_actualTime_error_(current_time, None, None)
             cg_image = result[0] if isinstance(result, tuple) else result
             if cg_image is None:
-                return
+                return _apply_last_frame_alias_if_available() if apply_wallpaper else False
 
             image = AppKit.NSImage.alloc().initWithCGImage_size_(cg_image, AppKit.NSZeroSize)
             bitmap = AppKit.NSBitmapImageRep.alloc().initWithCGImage_(cg_image)
@@ -780,21 +1074,20 @@ class AuraFlowController(NSObject):
                 if tiff_data is not None:
                     bitmap = AppKit.NSBitmapImageRep.imageRepWithData_(tiff_data)
             if bitmap is None:
-                return
+                return _apply_last_frame_alias_if_available() if apply_wallpaper else False
 
             png_data = bitmap.representationUsingType_properties_(AppKit.NSPNGFileType, None)
             if png_data is None:
-                return
+                return _apply_last_frame_alias_if_available() if apply_wallpaper else False
 
             ensure_app_support_dir()
             destination = _next_managed_frame_path()
             with destination.open("wb") as handle:
                 handle.write(bytes(png_data))
-            _sync_last_frame_alias(destination)
-            _cleanup_old_managed_frames(destination)
-            _apply_wallpaper_to_all_desktops(destination)
+            _commit_managed_frame(destination, apply_wallpaper=apply_wallpaper)
+            return True
         except Exception:
-            return
+            return _apply_last_frame_alias_if_available() if apply_wallpaper else False
 
 
 class WallpaperAppDelegate(NSObject):
@@ -803,18 +1096,25 @@ class WallpaperAppDelegate(NSObject):
     controller = objc.ivar()
     commandTimer = objc.ivar()
     playbackTimer = objc.ivar()
+    workspaceNotificationCenter = objc.ivar()
+    lastPlaybackPollMonotonic = objc.ivar()
+    lastWallpaperBackupRefreshMonotonic = objc.ivar()
 
     def initWithConfig_(self, config: DaemonConfig):
         self = objc.super(WallpaperAppDelegate, self).init()
         if self is None:
             return None
         self._config = config
+        self.lastPlaybackPollMonotonic = 0.0
+        self.lastWallpaperBackupRefreshMonotonic = 0.0
         return self
 
     def applicationDidFinishLaunching_(self, _notification):
         self.controller = AuraFlowController.alloc().initWithConfig_(self._config)
+        DAEMON_NO_FREEZE_PATH.unlink(missing_ok=True)
         DAEMON_PAUSED_PATH.unlink(missing_ok=True)
         DAEMON_COMMAND_PATH.unlink(missing_ok=True)
+        self._registerWorkspaceObservers()
         self.commandTimer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             0.25,
             self,
@@ -840,6 +1140,7 @@ class WallpaperAppDelegate(NSObject):
         self._shutdown()
 
     def _shutdown(self):
+        self._unregisterWorkspaceObservers()
         if self.commandTimer is not None:
             self.commandTimer.invalidate()
             self.commandTimer = None
@@ -847,17 +1148,110 @@ class WallpaperAppDelegate(NSObject):
             self.playbackTimer.invalidate()
             self.playbackTimer = None
         if self.controller is not None:
+            if not DAEMON_NO_FREEZE_PATH.exists():
+                self.controller.prepareForSessionTransition()
             self.controller.stop()
             self.controller = None
+        DAEMON_NO_FREEZE_PATH.unlink(missing_ok=True)
         DAEMON_PAUSED_PATH.unlink(missing_ok=True)
         DAEMON_COMMAND_PATH.unlink(missing_ok=True)
         remove_pid_file()
         remove_health_file()
 
+    def _registerWorkspaceObservers(self):
+        workspace = AppKit.NSWorkspace.sharedWorkspace()
+        notification_center = workspace.notificationCenter()
+        self.workspaceNotificationCenter = notification_center
+
+        notifications = [
+            getattr(AppKit.NSWorkspace, "willSleepNotification", None),
+            getattr(AppKit.NSWorkspace, "didWakeNotification", None),
+            getattr(AppKit.NSWorkspace, "screensDidSleepNotification", None),
+            getattr(AppKit.NSWorkspace, "screensDidWakeNotification", None),
+            getattr(AppKit.NSWorkspace, "sessionDidResignActiveNotification", None),
+            getattr(AppKit.NSWorkspace, "sessionDidBecomeActiveNotification", None),
+            getattr(AppKit.NSWorkspace, "activeSpaceDidChangeNotification", None),
+        ]
+
+        for name in notifications:
+            if name is None:
+                continue
+            selector = (
+                "workspaceWillNeedFreezeFrame:"
+                if name in {
+                    getattr(AppKit.NSWorkspace, "willSleepNotification", None),
+                    getattr(AppKit.NSWorkspace, "screensDidSleepNotification", None),
+                    getattr(AppKit.NSWorkspace, "sessionDidResignActiveNotification", None),
+                }
+                else "workspaceDidBecomeInteractive:"
+            )
+            notification_center.addObserver_selector_name_object_(
+                self,
+                selector,
+                name,
+                None,
+            )
+
+        screen_change_notification = getattr(
+            AppKit,
+            "NSApplicationDidChangeScreenParametersNotification",
+            None,
+        )
+        if screen_change_notification is not None:
+            NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+                self,
+                "workspaceDidBecomeInteractive:",
+                screen_change_notification,
+                None,
+            )
+
+    def _unregisterWorkspaceObservers(self):
+        if self.workspaceNotificationCenter is not None:
+            try:
+                self.workspaceNotificationCenter.removeObserver_(self)
+            except Exception:
+                pass
+            self.workspaceNotificationCenter = None
+        try:
+            NSNotificationCenter.defaultCenter().removeObserver_(self)
+        except Exception:
+            pass
+
+    def workspaceWillNeedFreezeFrame_(self, _notification):
+        if self.controller is not None:
+            self.controller.prepareForSessionTransition()
+            self._writeHealthSnapshot()
+
+    def workspaceDidBecomeInteractive_(self, _notification):
+        if self.controller is not None:
+            _recover_delegate_playback_after_interactive_transition(self)
+            self._writeHealthSnapshot()
+
     def _writeHealthSnapshot(self):
         if self.controller is None:
             return
         write_health_file(self.controller.healthSnapshot())
+
+    def _refreshWallpaperBackupIfNeeded(self, force: bool = False):
+        if self.controller is None:
+            return
+        if not force and getattr(self.controller, "_is_paused", False):
+            return
+
+        now = time.monotonic()
+        last_refresh = float(self.lastWallpaperBackupRefreshMonotonic or 0.0)
+        if (
+            not force
+            and last_refresh > 0.0
+            and (now - last_refresh) < WALLPAPER_BACKUP_REFRESH_INTERVAL_SECONDS
+        ):
+            return
+
+        self.lastWallpaperBackupRefreshMonotonic = now
+        try:
+            refresh_wallpaper_backup()
+        except Exception:
+            pass
 
     def pausePlayback(self):
         if self.controller is not None:
@@ -888,8 +1282,18 @@ class WallpaperAppDelegate(NSObject):
 
     def pollPlayback_(self, _timer):
         if self.controller is not None:
+            now = time.monotonic()
+            last_poll = float(self.lastPlaybackPollMonotonic or 0.0)
+            if (
+                last_poll > 0.0
+                and (now - last_poll) >= SLEEP_WAKE_GAP_THRESHOLD_SECONDS
+            ):
+                _recover_delegate_playback_after_interactive_transition(self)
+            self.lastPlaybackPollMonotonic = now
             self.controller.enforcePlaybackPolicies()
             self.controller.ensurePlaybackIsActive()
+            self.controller.checkpointWallpaperFrameIfNeeded()
+            self._refreshWallpaperBackupIfNeeded()
             self._writeHealthSnapshot()
 
 
@@ -941,6 +1345,10 @@ def run_daemon(config: DaemonConfig):
 
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except (AttributeError, OSError, ValueError):
+        pass
 
     try:
         AppHelper.runEventLoop()

@@ -2,6 +2,28 @@ import Testing
 import AVFoundation
 @testable import WallpaperControlApp
 
+private func writeTinyGIF(to url: URL) throws {
+    let bytes: [UInt8] = [
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00,
+        0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44,
+        0x01, 0x00, 0x3B,
+    ]
+    try Data(bytes).write(to: url, options: .atomic)
+}
+
+@Test func catalogOriginHeaderValueIncludesSchemeAndHost() {
+    let url = URL(string: "https://moewalls.com/anime/neon-ruins-live-wallpaper/")!
+    #expect(catalogOriginHeaderValue(for: url) == "https://moewalls.com")
+}
+
+@Test func catalogOriginHeaderValuePreservesExplicitPort() {
+    let url = URL(string: "http://localhost:8080/path")!
+    #expect(catalogOriginHeaderValue(for: url) == "http://localhost:8080")
+}
+
 @MainActor
 @Test func previewSetsPlayerWhenVideoSelected() throws {
     let controller = MockPythonController()
@@ -13,61 +35,561 @@ import AVFoundation
         try? FileManager.default.removeItem(at: tempURL)
     }
 
-    viewModel.videoURL = tempURL
-    viewModel.preview()
+    let wallpaper = DownloadedCatalogWallpaper(
+        id: "preview-test",
+        wallpaperID: "preview-test",
+        title: "Preview Test",
+        category: "Anime",
+        attribution: "Fixture",
+        previewImageURL: nil,
+        localPreviewPath: nil,
+        sourcePageURL: nil,
+        localPath: tempURL.path,
+        downloadedAt: Date()
+    )
+    viewModel.applyDownloadedCatalogWallpaper(wallpaper)
 
     #expect(viewModel.previewPlayer != nil)
     #expect(viewModel.previewPlayer?.currentItem != nil)
 }
 
 @MainActor
-@Test func catalogBackNavigatesDetailThenExitsCatalog() throws {
+@Test func localVideoSelectionStaysInPreviewUntilStart() throws {
     let controller = MockPythonController()
     let viewModel = AppViewModel(controller: controller)
+
+    let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("local-preview-only.mp4")
+    FileManager.default.createFile(atPath: tempURL.path, contents: Data(), attributes: nil)
+    defer {
+        try? FileManager.default.removeItem(at: tempURL)
+    }
+
+    viewModel.selectLocalVideoForPreview(tempURL)
+
+    #expect(viewModel.previewPlayer != nil)
+    #expect(viewModel.previewPlayer?.currentItem != nil)
+    #expect(controller.lastConfiguredVideoURL == nil)
+    #expect(controller.startCallCount == 0)
+    #expect(viewModel.isRunning == false)
+}
+
+@MainActor
+@Test func localPreviewVideoStartsAfterStopAndStart() async throws {
+    let controller = MockPythonController()
+    let defaults = UserDefaults(suiteName: "AppViewModelTests.local-preview-start")!
+    defaults.removePersistentDomain(forName: "AppViewModelTests.local-preview-start")
+    let optimizationStore = VideoOptimizationStore(defaults: defaults)
+    optimizationStore.save(
+        VideoOptimizationSettings(
+            enabled: false,
+            allowAV1PassthroughOnHardwareDecode: true,
+            transcodeH264ToHEVC: true,
+            forceSoftwareAV1Encode: false,
+            profile: .quality
+        )
+    )
+    let viewModel = AppViewModel(controller: controller, optimizationStore: optimizationStore)
+
+    let firstURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("local-preview-first.mp4")
+    let secondURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("local-preview-second.mp4")
+    FileManager.default.createFile(atPath: firstURL.path, contents: Data(), attributes: nil)
+    FileManager.default.createFile(atPath: secondURL.path, contents: Data(), attributes: nil)
+    defer {
+        try? FileManager.default.removeItem(at: firstURL)
+        try? FileManager.default.removeItem(at: secondURL)
+    }
+
+    viewModel.selectLocalVideoForPreview(firstURL)
+    viewModel.start()
+
+    for _ in 0..<20 {
+        if controller.lastConfiguredVideoURL == firstURL && controller.startCallCount == 1 && viewModel.isRunning {
+            break
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+
+    #expect(controller.lastConfiguredVideoURL == firstURL)
+    #expect(controller.startCallCount == 1)
+    #expect(viewModel.isRunning)
+
+    viewModel.selectLocalVideoForPreview(secondURL)
+    #expect(controller.lastConfiguredVideoURL == firstURL)
+
+    viewModel.stop()
+    for _ in 0..<20 {
+        if viewModel.isRunning == false {
+            break
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+
+    viewModel.start()
+    for _ in 0..<20 {
+        if controller.lastConfiguredVideoURL == secondURL && controller.startCallCount == 2 && viewModel.isRunning {
+            break
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+
+    #expect(controller.lastConfiguredVideoURL == secondURL)
+    #expect(controller.startCallCount == 2)
+    #expect(viewModel.isRunning)
+}
+
+@MainActor
+@Test func catalogDownloadStagesPreviewUntilStart() throws {
+    let controller = MockPythonController()
+    let viewModel = AppViewModel(controller: controller)
+
+    let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("catalog-preview-only.mp4")
+    FileManager.default.createFile(atPath: tempURL.path, contents: Data(), attributes: nil)
+    defer {
+        try? FileManager.default.removeItem(at: tempURL)
+    }
+
+    let wallpaper = CatalogWallpaper(
+        id: "catalog-preview-only",
+        title: "Catalog Preview Only",
+        category: "Anime",
+        attribution: "Fixture",
+        previewImageURL: nil,
+        sourcePageURL: URL(string: "https://example.com/catalog-preview-only"),
+        sources: [CatalogVideoSource(url: URL(string: "https://example.com/catalog-preview-only.mp4")!, width: 1920, height: 1080)]
+    )
+
+    viewModel.stageCatalogWallpaperForPreview(wallpaper, localURL: tempURL)
+
+    #expect(viewModel.previewPlayer != nil)
+    #expect(viewModel.previewPlayer?.currentItem != nil)
+    #expect(controller.lastConfiguredVideoURL == nil)
+    #expect(controller.startCallCount == 0)
+    #expect(viewModel.isRunning == false)
+    #expect(viewModel.statusMessage == "Wallpaper downloaded. Press Start to apply.")
+}
+
+@MainActor
+@Test func speedUpdateKeepsPreviewPlayerWhenWallpaperIsOnlyInPreview() async throws {
+    let controller = MockPythonController()
+    let viewModel = AppViewModel(controller: controller)
+
+    let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("preview-speed-keepalive.mp4")
+    FileManager.default.createFile(atPath: tempURL.path, contents: Data(), attributes: nil)
+    defer {
+        try? FileManager.default.removeItem(at: tempURL)
+    }
+
+    viewModel.selectLocalVideoForPreview(tempURL)
+    #expect(viewModel.previewPlayer != nil)
+
+    viewModel.updateSpeed(1.0)
+
+    for _ in 0..<20 {
+        if viewModel.isBusy == false {
+            break
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+
+    #expect(viewModel.previewPlayer != nil)
+    #expect(viewModel.previewPlayer?.currentItem != nil)
+    #expect(controller.startCallCount == 0)
+}
+
+@Test func previewPlaybackNeedsRestartWhenPausedAtTargetRate() {
+    #expect(
+        AppViewModel.previewPlaybackNeedsRestart(
+            currentRate: 1.0,
+            desiredRate: 1.0,
+            timeControlStatus: .paused
+        )
+    )
+    #expect(
+        AppViewModel.previewPlaybackNeedsRestart(
+            currentRate: 1.0,
+            desiredRate: 1.0,
+            timeControlStatus: .playing
+        ) == false
+    )
+}
+
+@MainActor
+@Test func downloadedWallpaperAppliesImmediately() async throws {
+    let controller = MockPythonController()
+    let defaults = UserDefaults(suiteName: "AppViewModelTests.downloaded-immediate")!
+    defaults.removePersistentDomain(forName: "AppViewModelTests.downloaded-immediate")
+    let optimizationStore = VideoOptimizationStore(defaults: defaults)
+    optimizationStore.save(
+        VideoOptimizationSettings(
+            enabled: false,
+            allowAV1PassthroughOnHardwareDecode: true,
+            transcodeH264ToHEVC: true,
+            forceSoftwareAV1Encode: false,
+            profile: .quality
+        )
+    )
+    let viewModel = AppViewModel(controller: controller, optimizationStore: optimizationStore)
+
+    let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("downloaded-immediate.gif")
+    try writeTinyGIF(to: tempURL)
+    defer {
+        try? FileManager.default.removeItem(at: tempURL)
+    }
+
+    let wallpaper = DownloadedCatalogWallpaper(
+        id: "downloaded-immediate",
+        wallpaperID: "downloaded-immediate",
+        title: "Immediate Apply Test",
+        category: "Anime",
+        attribution: "Fixture",
+        previewImageURL: nil,
+        localPreviewPath: nil,
+        sourcePageURL: nil,
+        localPath: tempURL.path,
+        downloadedAt: Date()
+    )
+
+    viewModel.applyDownloadedCatalogWallpaper(wallpaper)
+
+    for _ in 0..<60 {
+        if controller.lastConfiguredVideoURL != nil && controller.startCallCount > 0 && viewModel.isRunning {
+            break
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+
+    #expect(controller.lastConfiguredVideoURL != nil)
+    #expect(controller.startCallCount == 1)
+    #expect(viewModel.isRunning)
+}
+
+@MainActor
+@Test func catalogBackNavigatesDetailThenExitsCatalog() async throws {
+    let controller = MockPythonController()
+    let expectedWallpaper = CatalogWallpaper(
+        id: "test-wallpaper",
+        title: "Test Wallpaper",
+        category: "Anime",
+        attribution: "Fixture",
+        previewImageURL: nil,
+        sourcePageURL: URL(string: "https://example.com/test-wallpaper"),
+        sources: [CatalogVideoSource(url: URL(string: "https://example.com/test-wallpaper.mp4")!, width: 1920, height: 1080)]
+    )
+    let viewModel = AppViewModel(
+        controller: controller,
+        catalogProvider: MockCatalogProvider(wallpapers: [expectedWallpaper])
+    )
 
     viewModel.openCatalog()
     #expect(viewModel.isCatalogOpen)
 
-    let wallpaper = try #require(viewModel.catalogWallpapers.first)
-    viewModel.openCatalogWallpaper(wallpaper)
-    #expect(viewModel.selectedCatalogWallpaper == wallpaper)
+    viewModel.openCatalogWallpaper(expectedWallpaper)
+    #expect(viewModel.selectedCatalogWallpaper == expectedWallpaper)
 
     viewModel.navigateBackFromCatalog()
     #expect(viewModel.selectedCatalogWallpaper == nil)
     #expect(viewModel.isCatalogOpen)
 
     // Immediate retap should be ignored to avoid accidental reopen after Back.
-    viewModel.openCatalogWallpaper(wallpaper)
+    viewModel.openCatalogWallpaper(expectedWallpaper)
     #expect(viewModel.selectedCatalogWallpaper == nil)
 
     viewModel.navigateBackFromCatalog()
     #expect(viewModel.isCatalogOpen == false)
 }
 
-final class MockPythonController: PythonControlling {
-    func status() throws -> ControlStatus {
-        ControlStatus(
-            running: false,
-            config: ControlConfig(video_path: "", playback_speed: 1.0, volume: 0.0, autostart: false),
-            pid: nil,
-            autostart: false
+@MainActor
+@Test func startIgnoresRequestsWhileWallpaperIsAlreadyRunning() async throws {
+    let controller = MockPythonController()
+    let defaults = UserDefaults(suiteName: "AppViewModelTests.start-preview")!
+    defaults.removePersistentDomain(forName: "AppViewModelTests.start-preview")
+    let optimizationStore = VideoOptimizationStore(defaults: defaults)
+    optimizationStore.save(
+        VideoOptimizationSettings(
+            enabled: false,
+            allowAV1PassthroughOnHardwareDecode: true,
+            transcodeH264ToHEVC: true,
+            forceSoftwareAV1Encode: false,
+            profile: .quality
         )
+    )
+    let viewModel = AppViewModel(controller: controller, optimizationStore: optimizationStore)
+
+    let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("start-preview-test.gif")
+    try writeTinyGIF(to: tempURL)
+    defer {
+        try? FileManager.default.removeItem(at: tempURL)
+    }
+
+    let wallpaper = DownloadedCatalogWallpaper(
+        id: "start-preview-test",
+        wallpaperID: "start-preview-test",
+        title: "Start Preview Test",
+        category: "Anime",
+        attribution: "Fixture",
+        previewImageURL: nil,
+        localPreviewPath: nil,
+        sourcePageURL: nil,
+        localPath: tempURL.path,
+        downloadedAt: Date()
+    )
+
+    viewModel.applyDownloadedCatalogWallpaper(wallpaper)
+
+    for _ in 0..<60 {
+        if controller.lastConfiguredVideoURL != nil && controller.startCallCount == 1 && viewModel.isRunning {
+            break
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+
+    viewModel.start()
+    try? await Task.sleep(nanoseconds: 100_000_000)
+
+    #expect(controller.lastConfiguredVideoURL != nil)
+    #expect(controller.startCallCount == 1)
+    #expect(viewModel.isRunning)
+}
+
+@MainActor
+@Test func startAndStopButtonsTrackRunningAndPausedWallpaperState() async throws {
+    let controller = MockPythonController()
+    let defaults = UserDefaults(suiteName: "AppViewModelTests.button-state")!
+    defaults.removePersistentDomain(forName: "AppViewModelTests.button-state")
+    let optimizationStore = VideoOptimizationStore(defaults: defaults)
+    optimizationStore.save(
+        VideoOptimizationSettings(
+            enabled: false,
+            allowAV1PassthroughOnHardwareDecode: true,
+            transcodeH264ToHEVC: true,
+            forceSoftwareAV1Encode: false,
+            profile: .quality
+        )
+    )
+    let viewModel = AppViewModel(controller: controller, optimizationStore: optimizationStore)
+
+    let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("button-state-test.mp4")
+    FileManager.default.createFile(atPath: tempURL.path, contents: Data(), attributes: nil)
+    defer {
+        try? FileManager.default.removeItem(at: tempURL)
+    }
+
+    viewModel.selectLocalVideoForPreview(tempURL)
+    #expect(viewModel.isStartButtonHighlighted)
+    #expect(viewModel.isStopButtonHighlighted == false)
+    #expect(viewModel.canStart)
+    #expect(viewModel.canStop == false)
+
+    viewModel.start()
+    for _ in 0..<20 {
+        if viewModel.isRunning {
+            break
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+
+    #expect(viewModel.isRunning)
+    #expect(viewModel.isPlaybackPaused == false)
+    #expect(viewModel.isStartButtonHighlighted)
+    #expect(viewModel.isStopButtonHighlighted == false)
+    #expect(viewModel.canStart == false)
+    #expect(viewModel.canStop)
+
+    viewModel.stop()
+    for _ in 0..<20 {
+        if viewModel.isPlaybackPaused && viewModel.isRunning == false {
+            break
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+
+    #expect(viewModel.isRunning == false)
+    #expect(viewModel.isPlaybackPaused)
+    #expect(viewModel.isStartButtonHighlighted == false)
+    #expect(viewModel.isStopButtonHighlighted)
+    #expect(viewModel.canStart)
+    #expect(viewModel.canStop == false)
+}
+
+@MainActor
+@Test func suspiciousRunningDaemonKeepsStartAvailable() async throws {
+    let controller = MockPythonController()
+    let viewModel = AppViewModel(controller: controller)
+
+    let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("suspicious-running-test.mp4")
+    FileManager.default.createFile(atPath: tempURL.path, contents: Data(), attributes: nil)
+    defer {
+        try? FileManager.default.removeItem(at: tempURL)
+    }
+
+    controller.configuredVideoURL = tempURL
+    controller.statusRunning = true
+    controller.statusPaused = false
+    controller.statusHealth = DaemonHealth(
+        contract_version: 2,
+        available: true,
+        fresh: true,
+        suspicious: true,
+        reason: "time_stuck",
+        updated_at: Date().timeIntervalSince1970,
+        lag_seconds: 0,
+        screens: 1,
+        windows: 1,
+        player_rate: 1.0,
+        stall_events: 1,
+        recovery_events: 0,
+        consecutive_stall_polls: 1,
+        paused: false,
+        manual_paused: false,
+        low_power_mode: false,
+        auto_paused_for_low_power: false,
+        pause_on_fullscreen: true,
+        fullscreen_app_detected: false,
+        auto_paused_for_fullscreen: false,
+        blend_interpolation_enabled: false,
+        blend_interpolation_active: false,
+        scale_mode: "fill"
+    )
+
+    await viewModel.loadStatus()
+
+    #expect(viewModel.isRunning)
+    #expect(viewModel.isPlaybackActive == false)
+    #expect(viewModel.isPlaybackPaused == false)
+    #expect(viewModel.canStart)
+    #expect(viewModel.canStop == false)
+    #expect(viewModel.isStartButtonHighlighted)
+    #expect(viewModel.isStopButtonHighlighted == false)
+}
+
+@MainActor
+@Test func startForcesPlaybackWhenSetVideoReturnsSuspiciousRunningState() async throws {
+    let controller = MockPythonController()
+    let defaults = UserDefaults(suiteName: "AppViewModelTests.suspicious-start")!
+    defaults.removePersistentDomain(forName: "AppViewModelTests.suspicious-start")
+    let optimizationStore = VideoOptimizationStore(defaults: defaults)
+    optimizationStore.save(
+        VideoOptimizationSettings(
+            enabled: false,
+            allowAV1PassthroughOnHardwareDecode: true,
+            transcodeH264ToHEVC: true,
+            forceSoftwareAV1Encode: false,
+            profile: .quality
+        )
+    )
+    let viewModel = AppViewModel(controller: controller, optimizationStore: optimizationStore)
+
+    let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("suspicious-start-test.mp4")
+    FileManager.default.createFile(atPath: tempURL.path, contents: Data(), attributes: nil)
+    defer {
+        try? FileManager.default.removeItem(at: tempURL)
+    }
+
+    controller.setVideoStatusOverride = ControlStatus(
+        running: true,
+        config: ControlConfig(
+            video_path: tempURL.path,
+            playback_speed: 1.0,
+            volume: 0.0,
+            autostart: false
+        ),
+        pid: 1234,
+        autostart: false,
+        paused: false,
+        health: DaemonHealth(
+            contract_version: 2,
+            available: true,
+            fresh: true,
+            suspicious: true,
+            reason: "missing_heartbeat",
+            updated_at: Date().timeIntervalSince1970,
+            lag_seconds: 0,
+            screens: 1,
+            windows: 1,
+            player_rate: 0,
+            stall_events: 0,
+            recovery_events: 0,
+            consecutive_stall_polls: 0,
+            paused: false,
+            manual_paused: false,
+            low_power_mode: false,
+            auto_paused_for_low_power: false,
+            pause_on_fullscreen: true,
+            fullscreen_app_detected: false,
+            auto_paused_for_fullscreen: false,
+            blend_interpolation_enabled: false,
+            blend_interpolation_active: false,
+            scale_mode: "fill"
+        )
+    )
+
+    viewModel.selectLocalVideoForPreview(tempURL)
+    viewModel.start()
+
+    for _ in 0..<20 {
+        if controller.startCallCount == 1 && viewModel.isPlaybackActive {
+            break
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+
+    #expect(controller.lastConfiguredVideoURL == tempURL)
+    #expect(controller.startCallCount == 1)
+    #expect(viewModel.isPlaybackActive)
+    #expect(viewModel.canStop)
+}
+
+final class MockPythonController: PythonControlling {
+    var configuredVideoURL: URL?
+    var lastConfiguredVideoURL: URL?
+    var startCallCount = 0
+    var statusRunning = false
+    var statusPaused: Bool?
+    var statusHealth: DaemonHealth?
+    var setVideoStatusOverride: ControlStatus?
+
+    func status() throws -> ControlStatus {
+        statusPayload(running: statusRunning, paused: statusPaused, health: statusHealth)
     }
 
     func start(videoURL: URL?, speed: Double?) throws -> ControlStatus {
-        try status()
+        startCallCount += 1
+        if let videoURL {
+            configuredVideoURL = videoURL
+            lastConfiguredVideoURL = videoURL
+        }
+        statusRunning = true
+        statusPaused = false
+        statusHealth = nil
+        return statusPayload(running: true, paused: false, health: nil)
     }
 
     func stop() throws -> ControlStatus {
-        try status()
+        statusRunning = false
+        statusPaused = true
+        statusHealth = nil
+        return statusPayload(running: false, paused: true, health: nil)
     }
 
     func clearWallpaper() throws -> ControlStatus {
-        try status()
+        statusRunning = false
+        statusPaused = false
+        configuredVideoURL = nil
+        lastConfiguredVideoURL = nil
+        statusHealth = nil
+        return statusPayload(running: false, paused: false, health: nil)
     }
 
     func setVideo(_ url: URL) throws -> ControlStatus {
-        try status()
+        configuredVideoURL = url
+        lastConfiguredVideoURL = url
+        if let setVideoStatusOverride {
+            return setVideoStatusOverride
+        }
+        statusRunning = false
+        statusPaused = true
+        statusHealth = nil
+        return statusPayload(running: false, paused: true, health: nil)
     }
 
     func setSpeed(_ speed: Double) throws -> ControlStatus {
@@ -92,5 +614,45 @@ final class MockPythonController: PythonControlling {
 
     func metrics() throws -> DaemonMetrics {
         DaemonMetrics(running: false)
+    }
+
+    private func statusPayload(
+        running: Bool,
+        paused: Bool? = nil,
+        health: DaemonHealth? = nil
+    ) -> ControlStatus {
+        ControlStatus(
+            running: running,
+            config: ControlConfig(
+                video_path: configuredVideoURL?.path ?? "",
+                playback_speed: 1.0,
+                volume: 0.0,
+                autostart: false
+            ),
+            pid: running ? 1234 : nil,
+            autostart: false,
+            paused: paused ?? !running,
+            health: health
+        )
+    }
+}
+
+actor MockCatalogProvider: WallpaperCatalogProviding {
+    let wallpapers: [CatalogWallpaper]
+
+    init(wallpapers: [CatalogWallpaper]) {
+        self.wallpapers = wallpapers
+    }
+
+    func loadCachedCatalog() async -> [CatalogWallpaper]? {
+        wallpapers
+    }
+
+    func fetchCatalog() async throws -> [CatalogWallpaper] {
+        wallpapers
+    }
+
+    func resolveDownloadURL(for wallpaper: CatalogWallpaper) async throws -> URL {
+        wallpaper.sources.first?.url ?? URL(string: "https://example.com/fallback.mp4")!
     }
 }

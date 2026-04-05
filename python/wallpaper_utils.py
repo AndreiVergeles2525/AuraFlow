@@ -4,6 +4,7 @@ Utility helpers for working with video frames and macOS desktop wallpaper.
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 import shutil
@@ -14,8 +15,12 @@ from pathlib import Path
 from paths import (
     APP_SUPPORT_DIR,
     LAST_FRAME_PATH,
+    SYSTEM_WALLPAPER_INDEX_PATH,
     WALLPAPER_BACKUP_PATH,
+    WALLPAPER_DESKTOP_BACKUP_PATH,
+    WALLPAPER_DESKTOP_ORIGINAL_BACKUP_PATH,
     WALLPAPER_ORIGINAL_BACKUP_PATH,
+    WALLPAPER_STORE_BACKUP_PATH,
     ensure_app_support_dir,
 )
 
@@ -96,6 +101,97 @@ def _write_wallpaper_backup(path: Path, wallpapers: dict[str, str]) -> None:
     )
 
 
+def _save_wallpaper_store_backup_if_needed() -> None:
+    try:
+        source = SYSTEM_WALLPAPER_INDEX_PATH.expanduser().resolve(strict=False)
+    except OSError:
+        return
+    if not source.exists() or not source.is_file():
+        return
+
+    try:
+        if WALLPAPER_STORE_BACKUP_PATH.exists():
+            current_bytes = WALLPAPER_STORE_BACKUP_PATH.read_bytes()
+            source_bytes = source.read_bytes()
+            if current_bytes == source_bytes:
+                return
+            WALLPAPER_STORE_BACKUP_PATH.write_bytes(source_bytes)
+            return
+        shutil.copy2(source, WALLPAPER_STORE_BACKUP_PATH)
+    except OSError:
+        return
+
+
+def _reload_wallpaper_services() -> None:
+    for process_name in (
+        "WallpaperAgent",
+        "wallpaperexportd",
+        "WallpaperImageExtension",
+        "WallpaperSequoiaExtension",
+        "WallpaperLegacyExtension",
+        "WallpaperDynamicExtension",
+        "WallpaperAerialsExtension",
+        "NeptuneOneWallpaper",
+        "Dock",
+    ):
+        try:
+            subprocess.run(  # noqa: S603
+                ["killall", process_name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            continue
+
+
+def _restore_wallpaper_store_backup() -> bool:
+    try:
+        source = WALLPAPER_STORE_BACKUP_PATH.expanduser().resolve(strict=False)
+        destination = SYSTEM_WALLPAPER_INDEX_PATH.expanduser().resolve(strict=False)
+    except OSError:
+        return False
+
+    if not source.exists() or not source.is_file():
+        return False
+
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    except OSError:
+        return False
+
+    _reload_wallpaper_services()
+    return True
+
+
+def _load_desktop_picture_backup(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+
+    pictures: list[str] = []
+    for value in data:
+        if not isinstance(value, str) or not value:
+            continue
+        if _is_managed_wallpaper(value):
+            continue
+        pictures.append(value)
+    return pictures
+
+
+def _write_desktop_picture_backup(path: Path, desktop_paths: list[str]) -> None:
+    path.write_text(
+        json.dumps(desktop_paths, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _managed_frame_suffix() -> str:
     return LAST_FRAME_PATH.suffix or ".png"
 
@@ -161,6 +257,18 @@ def _cleanup_old_managed_frames(keep: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+def _commit_managed_frame(
+    destination: Path,
+    *,
+    apply_wallpaper: bool = True,
+) -> Path:
+    _sync_last_frame_alias(destination)
+    _cleanup_old_managed_frames(destination)
+    if apply_wallpaper:
+        set_wallpaper(destination)
+    return destination
+
+
 def _is_managed_wallpaper(path: str) -> bool:
     """Return True when a wallpaper path points to AuraFlow's generated frame."""
 
@@ -173,6 +281,12 @@ def _is_managed_wallpaper(path: str) -> bool:
     if candidate == managed:
         return True
     return _is_managed_frame_candidate(candidate)
+def _current_screen_ids() -> list[str]:
+    try:
+        screens = AppKit.NSScreen.screens()
+    except Exception:
+        return []
+    return [_screen_identifier(screen) for screen in screens]
 
 
 def _save_wallpaper_backup_if_needed() -> None:
@@ -180,17 +294,21 @@ def _save_wallpaper_backup_if_needed() -> None:
     wallpapers = _sanitize_wallpaper_backup(_current_wallpapers())
     if not wallpapers:
         return
-
+    _save_wallpaper_store_backup_if_needed()
     existing = _load_wallpaper_backup(WALLPAPER_BACKUP_PATH)
     if existing == wallpapers:
-        original_existing = _load_wallpaper_backup(WALLPAPER_ORIGINAL_BACKUP_PATH)
-        if not original_existing:
-            _write_wallpaper_backup(WALLPAPER_ORIGINAL_BACKUP_PATH, wallpapers)
         return
 
     _write_wallpaper_backup(WALLPAPER_BACKUP_PATH, wallpapers)
-    if not _load_wallpaper_backup(WALLPAPER_ORIGINAL_BACKUP_PATH):
-        _write_wallpaper_backup(WALLPAPER_ORIGINAL_BACKUP_PATH, wallpapers)
+
+
+def refresh_wallpaper_backup() -> None:
+    """
+    Refresh the stored non-AuraFlow wallpaper snapshot from current system state.
+    """
+
+    _require_macos_frameworks()
+    _save_wallpaper_backup_if_needed()
 
 
 def _restore_wallpaper_paths(wallpapers: dict[str, str]) -> bool:
@@ -198,6 +316,7 @@ def _restore_wallpaper_paths(wallpapers: dict[str, str]) -> bool:
 
     workspace = AppKit.NSWorkspace.sharedWorkspace()
     fallback = next(iter(wallpapers.values()), None)
+    unique_paths = {path for path in wallpapers.values() if path}
     restored = False
     applied_fallback_path: str | None = None
 
@@ -225,6 +344,11 @@ def _restore_wallpaper_paths(wallpapers: dict[str, str]) -> bool:
 
     if not restored:
         return False
+
+    if applied_fallback_path and len(unique_paths) <= 1:
+        if not _set_all_desktops_picture_via_system_events(applied_fallback_path):
+            return False
+        return True
 
     # Fast path: NSWorkspace restore already replaced AuraFlow-managed frames.
     # Add a short grace window because desktop API state can lag slightly.
@@ -272,27 +396,16 @@ def _set_all_desktops_picture_via_system_events(path: str) -> bool:
     """
 
     escaped_path = path.replace("\\", "\\\\").replace('"', '\\"')
-    scripts = [
-        (
-            'tell application "System Events"\n'
-            f'  repeat with d in desktops\n'
-            f'    set picture of d to POSIX file "{escaped_path}"\n'
-            "  end repeat\n"
-            "end tell"
-        ),
-        (
-            'tell application "System Events" '
-            f'to set picture of every desktop to POSIX file "{escaped_path}"'
-        ),
-        (
-            'tell application "Finder" '
-            f'to set desktop picture to POSIX file "{escaped_path}"'
-        ),
-    ]
-
-    verification_script = (
+    apply_and_verify_script = (
         'tell application "System Events"\n'
         f'  set targetPath to POSIX path of (POSIX file "{escaped_path}")\n'
+        "  try\n"
+        "    repeat with d in desktops\n"
+        f'      set picture of d to POSIX file "{escaped_path}"\n'
+        "    end repeat\n"
+        "  on error\n"
+        '    return "error"\n'
+        "  end try\n"
         "  repeat with d in desktops\n"
         "    try\n"
         "      set currentPath to POSIX path of (picture of d)\n"
@@ -307,19 +420,71 @@ def _set_all_desktops_picture_via_system_events(path: str) -> bool:
         "end tell"
     )
 
-    for _ in range(3):
-        for script in scripts:
-            result = _run_osascript(script)
-            if result is None:
-                return False
-            if result.returncode != 0:
-                continue
-            verification = _run_osascript(verification_script)
-            if verification is None:
-                return False
-            if verification.returncode == 0 and verification.stdout.strip() == "ok":
-                return True
-        time.sleep(0.15)
+    for _ in range(2):
+        result = _run_osascript(apply_and_verify_script)
+        if result is None:
+            return False
+        if result.returncode == 0 and result.stdout.strip() == "ok":
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _set_desktop_picture_paths_via_system_events(desktop_paths: list[str]) -> bool:
+    filtered_paths = [path for path in desktop_paths if path]
+    if not filtered_paths:
+        return False
+
+    escaped_paths = [
+        '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        for path in filtered_paths
+    ]
+    script = (
+        'tell application "System Events"\n'
+        f'  set targetPaths to {{{", ".join(escaped_paths)}}}\n'
+        "  set desktopCount to count of desktops\n"
+        "  set targetCount to count of targetPaths\n"
+        "  if targetCount is 0 then\n"
+        '    return "error"\n'
+        "  end if\n"
+        "  try\n"
+        "    repeat with i from 1 to desktopCount\n"
+        "      set targetIndex to i\n"
+        "      if targetIndex > targetCount then\n"
+        "        set targetIndex to targetCount\n"
+        "      end if\n"
+        "      set targetPath to item targetIndex of targetPaths\n"
+        "      set picture of desktop i to POSIX file targetPath\n"
+        "    end repeat\n"
+        "  on error\n"
+        '    return "error"\n'
+        "  end try\n"
+        "  repeat with i from 1 to desktopCount\n"
+        "    set targetIndex to i\n"
+        "    if targetIndex > targetCount then\n"
+        "      set targetIndex to targetCount\n"
+        "    end if\n"
+        "    set targetPath to item targetIndex of targetPaths\n"
+        "    try\n"
+        "      set currentPath to POSIX path of (picture of desktop i)\n"
+        "      if currentPath is not targetPath then\n"
+        '        return "mismatch"\n'
+        "      end if\n"
+        "    on error\n"
+        '      return "mismatch"\n'
+        "    end try\n"
+        "  end repeat\n"
+        '  return "ok"\n'
+        "end tell"
+    )
+
+    for _ in range(2):
+        result = _run_osascript(script)
+        if result is None:
+            return False
+        if result.returncode == 0 and result.stdout.strip() == "ok":
+            return True
+        time.sleep(0.05)
     return False
 
 
@@ -333,6 +498,63 @@ def _run_osascript(script: str):
         )
     except OSError:
         return None
+
+
+def _desktop_picture_paths_via_system_events() -> list[str]:
+    script = (
+        'tell application "System Events"\n'
+        "  set outputLines to {}\n"
+        "  repeat with d in desktops\n"
+        "    try\n"
+        "      set end of outputLines to POSIX path of (picture of d)\n"
+        "    end try\n"
+        "  end repeat\n"
+        '  return outputLines as string\n'
+        "end tell"
+    )
+    result = _run_osascript(script)
+    if result is None or result.returncode != 0:
+        return []
+    raw = result.stdout.strip()
+    if not raw:
+        return []
+    lines = [line.strip() for line in raw.split(", ") if line.strip()]
+    normalized: list[str] = []
+    for line in lines:
+        if _is_managed_wallpaper(line):
+            continue
+        normalized.append(line)
+    return normalized
+
+
+def _normalize_wallpaper_backup_for_spaces(wallpapers: dict[str, str]) -> dict[str, str]:
+    desktop_candidates = _desktop_picture_paths_via_system_events()
+    if desktop_candidates:
+        ranked = Counter(desktop_candidates).most_common()
+        target_ids = list(wallpapers.keys()) or _current_screen_ids() or ["1"]
+        if not ranked:
+            return wallpapers
+        canonical_path = ranked[0][0]
+        if not canonical_path:
+            return wallpapers
+        return {screen_id: canonical_path for screen_id in target_ids}
+
+    if not wallpapers:
+        return wallpapers
+
+    candidates = [path for path in wallpapers.values() if path and not _is_managed_wallpaper(path)]
+    if not candidates:
+        return wallpapers
+
+    ranked = Counter(candidates).most_common()
+    if not ranked:
+        return wallpapers
+
+    canonical_path = ranked[0][0]
+    if not canonical_path:
+        return wallpapers
+
+    return {screen_id: canonical_path for screen_id in wallpapers.keys()}
 
 
 def _ffmpeg_candidate_executables() -> list[str]:
@@ -438,19 +660,19 @@ def _fallback_system_wallpaper() -> dict[str, str]:
 def restore_wallpaper_backup(
     delete_backup: bool = False,
     allow_fallback: bool = False,
+    allow_original_fallback: bool = False,
 ) -> bool:
     """
-    Restore system wallpaper URLs captured before AuraFlow first changed them.
+    Restore the latest non-AuraFlow wallpaper snapshot.
     """
 
-    _require_macos_frameworks()
-    wallpapers = _load_wallpaper_backup(WALLPAPER_BACKUP_PATH)
-    restored = _restore_wallpaper_paths(wallpapers) if wallpapers else False
+    _ = allow_original_fallback
 
-    if not restored:
-        original_wallpapers = _load_wallpaper_backup(WALLPAPER_ORIGINAL_BACKUP_PATH)
-        if original_wallpapers:
-            restored = _restore_wallpaper_paths(original_wallpapers)
+    _require_macos_frameworks()
+    restored = _restore_wallpaper_store_backup()
+    wallpapers = _load_wallpaper_backup(WALLPAPER_BACKUP_PATH)
+    if not restored and wallpapers:
+        restored = _restore_wallpaper_paths(wallpapers)
 
     if not restored and allow_fallback:
         fallback_wallpapers = _fallback_system_wallpaper()
@@ -459,7 +681,7 @@ def restore_wallpaper_backup(
 
     if restored and delete_backup:
         WALLPAPER_BACKUP_PATH.unlink(missing_ok=True)
-        WALLPAPER_ORIGINAL_BACKUP_PATH.unlink(missing_ok=True)
+        WALLPAPER_STORE_BACKUP_PATH.unlink(missing_ok=True)
     return restored
 
 
@@ -550,9 +772,9 @@ def set_wallpaper(image_path: Path) -> None:
 
 def set_wallpaper_from_video(video_path: Path) -> Path:
     """
-    Extract the first frame of a video file and set it as the system wallpaper.
+    Extract a representative frame and update AuraFlow's managed wallpaper.
 
-    Returns the temporary image path that was applied.
+    Returns the captured frame file used to refresh ``LAST_FRAME_PATH``.
     """
     try:
         image = extract_first_frame(video_path)
@@ -562,7 +784,7 @@ def set_wallpaper_from_video(video_path: Path) -> Path:
         # extraction from the current video to avoid reusing stale last_frame.
         ffmpeg_frame = _extract_first_frame_with_ffmpeg(video_path)
         if ffmpeg_frame is not None:
-            set_wallpaper(ffmpeg_frame)
+            _commit_managed_frame(ffmpeg_frame, apply_wallpaper=True)
             return ffmpeg_frame
         current = _current_wallpapers()
         for path in current.values():
@@ -572,5 +794,5 @@ def set_wallpaper_from_video(video_path: Path) -> Path:
         raise
 
     temp_path = save_image_to_temp(image)
-    set_wallpaper(temp_path)
+    _commit_managed_frame(temp_path, apply_wallpaper=True)
     return temp_path

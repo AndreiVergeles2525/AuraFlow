@@ -17,22 +17,26 @@ class DaemonManagerTests(unittest.TestCase):
         self.log_path = Path(self.temp_dir.name) / "daemon.log"
         self.health_path = Path(self.temp_dir.name) / "daemon.health.json"
         self.config_path = Path(self.temp_dir.name) / "config.json"
+        self.no_freeze_path = Path(self.temp_dir.name) / "daemon.no-freeze"
         self.config_path.write_text("{}", encoding="utf-8")
         patcher_pid = mock.patch.object(daemon_manager, "PID_PATH", self.pid_path)
         patcher_log = mock.patch.object(daemon_manager, "LOG_PATH", self.log_path)
         patcher_health = mock.patch.object(daemon_manager, "DAEMON_HEALTH_PATH", self.health_path)
         patcher_config = mock.patch.object(daemon_manager, "CONFIG_PATH", self.config_path)
+        patcher_no_freeze = mock.patch.object(daemon_manager, "DAEMON_NO_FREEZE_PATH", self.no_freeze_path)
         self.lock_path = Path(self.temp_dir.name) / "daemon.lock"
         patcher_lock = mock.patch.object(daemon_manager, "DAEMON_LOCK_PATH", self.lock_path)
         self.addCleanup(patcher_pid.stop)
         self.addCleanup(patcher_log.stop)
         self.addCleanup(patcher_health.stop)
         self.addCleanup(patcher_config.stop)
+        self.addCleanup(patcher_no_freeze.stop)
         self.addCleanup(patcher_lock.stop)
         patcher_pid.start()
         patcher_log.start()
         patcher_health.start()
         patcher_config.start()
+        patcher_no_freeze.start()
         patcher_lock.start()
         patcher_support = mock.patch.object(daemon_manager, "ensure_app_support_dir")
         self.addCleanup(patcher_support.stop)
@@ -78,14 +82,97 @@ class DaemonManagerTests(unittest.TestCase):
         kill.assert_called()
         self.assertFalse(self.pid_path.exists())
 
+    def test_stop_daemon_without_preserving_frame_sets_and_clears_flag(self):
+        self.pid_path.write_text("321", encoding="utf-8")
+
+        with mock.patch("os.kill") as kill:
+            kill.side_effect = [None, OSError()]
+            daemon_manager.stop_daemon(preserve_frame=False)
+
+        kill.assert_called()
+        self.assertFalse(self.no_freeze_path.exists())
+
+    def test_start_daemon_reconfiguring_video_stops_without_preserving_old_frame(self):
+        with mock.patch.object(daemon_manager, "_cleanup_orphaned_daemons"):
+            with mock.patch.object(daemon_manager, "daemon_running", return_value=True):
+                with mock.patch.object(daemon_manager, "read_pid", return_value=777):
+                    with mock.patch.object(daemon_manager, "stop_daemon") as stop:
+                        with mock.patch.object(daemon_manager, "_launch_daemon", return_value=778):
+                            with mock.patch.object(daemon_manager, "_resolve_primary_daemon_pid", return_value=778):
+                                daemon_manager.start_daemon(
+                                    config_path=self.config_path,
+                                    video_path="/tmp/new-video.mp4",
+                                )
+
+        stop.assert_called_once_with(timeout=1.5, preserve_frame=False)
+
+    def test_restart_daemon_reconfiguring_video_stops_without_preserving_old_frame(self):
+        with mock.patch.object(daemon_manager, "stop_daemon") as stop:
+            with mock.patch.object(daemon_manager, "start_daemon", return_value=778) as start:
+                pid = daemon_manager.restart_daemon(
+                    config_path=self.config_path,
+                    video_path="/tmp/new-video.mp4",
+                )
+
+        self.assertEqual(pid, 778)
+        stop.assert_called_once_with(timeout=1.5, preserve_frame=False)
+        start.assert_called_once_with(
+            config_path=self.config_path,
+            video_path="/tmp/new-video.mp4",
+            playback_speed=None,
+            volume=None,
+            blend_interpolation=None,
+            pause_on_fullscreen=None,
+            scale_mode=None,
+            wait=0.5,
+        )
+
     def test_enable_autostart_writes_launch_agent(self):
         agent_dir = Path(self.temp_dir.name) / "LaunchAgents"
         agent_dir.mkdir()
         agent_path = agent_dir / "com.example.videowallpaper.plist"
         with mock.patch.object(daemon_manager, "AGENT_PLIST_PATH", agent_path):
-            daemon_manager.enable_autostart(config_path=self.config_path)
+            with mock.patch.object(daemon_manager, "_launchctl", return_value=True):
+                daemon_manager.enable_autostart(config_path=self.config_path)
 
         self.assertTrue(agent_path.exists())
+        payload = agent_path.read_bytes()
+        self.assertIn(b"control.py", payload)
+        self.assertIn(b"<string>start</string>", payload)
+
+    def test_enable_autostart_loads_agent_into_current_session(self):
+        agent_dir = Path(self.temp_dir.name) / "LaunchAgents"
+        agent_dir.mkdir()
+        agent_path = agent_dir / "com.example.videowallpaper.plist"
+
+        with mock.patch.object(daemon_manager, "AGENT_PLIST_PATH", agent_path):
+            with mock.patch.object(daemon_manager, "_launchctl", return_value=True) as launchctl:
+                daemon_manager.enable_autostart(config_path=self.config_path)
+
+        launchctl.assert_any_call(
+            ["bootstrap", f"gui/{os.getuid()}", str(agent_path)],
+            ignore_errors=True,
+        )
+        launchctl.assert_any_call(
+            ["kickstart", "-k", f"gui/{os.getuid()}/{daemon_manager.APP_ID}"],
+            ignore_errors=True,
+        )
+
+    def test_disable_autostart_unloads_and_removes_agent(self):
+        agent_dir = Path(self.temp_dir.name) / "LaunchAgents"
+        agent_dir.mkdir()
+        agent_path = agent_dir / "com.example.videowallpaper.plist"
+        agent_path.write_text("plist", encoding="utf-8")
+
+        with mock.patch.object(daemon_manager, "AGENT_PLIST_PATH", agent_path):
+            with mock.patch.object(daemon_manager, "_launchctl", return_value=True) as launchctl:
+                daemon_manager.disable_autostart()
+
+        self.assertFalse(agent_path.exists())
+        launchctl.assert_any_call(
+            ["bootout", f"gui/{os.getuid()}/{daemon_manager.APP_ID}"],
+            ignore_errors=True,
+        )
 
     def test_daemon_health_marks_missing_heartbeat_as_suspicious(self):
         with mock.patch.object(daemon_manager, "daemon_running", return_value=True):
@@ -106,7 +193,7 @@ class DaemonManagerTests(unittest.TestCase):
         self.assertIn("stale_heartbeat", health["reason"])
 
     def test_daemon_resource_metrics_parses_ps_output(self):
-        fake_ps = mock.Mock(returncode=0, stdout="456 12.5 20480\n457 3.0 10240\n")
+        fake_ps = mock.Mock(returncode=0, stdout="456 12.5 20480 81920\n457 3.0 10240 40960\n")
         with mock.patch.object(daemon_manager, "_list_daemon_pids", return_value={456, 457}):
             with mock.patch.object(daemon_manager, "_resolve_primary_daemon_pid", return_value=456):
                 with mock.patch.object(daemon_manager, "daemon_paused", return_value=False):
@@ -124,6 +211,7 @@ class DaemonManagerTests(unittest.TestCase):
         self.assertEqual(metrics["process_count"], 2)
         self.assertAlmostEqual(metrics["cpu_percent"], 15.5)
         self.assertAlmostEqual(metrics["memory_mb"], 30.0)
+        self.assertAlmostEqual(metrics["virtual_memory_mb"], 120.0)
         self.assertEqual(metrics["thread_count"], 11)
 
     def test_daemon_running_recovers_from_stale_pid_file(self):

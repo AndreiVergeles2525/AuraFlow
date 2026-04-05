@@ -1,0 +1,9 @@
+{
+  "name": "MoeWalls",
+  "routes": {
+    "/": {},
+    "/wp/v2/posts": {},
+    "/wp/v2/categories": {},
+    "/wp/v2/tags": {}
+  }
+}

@@ -33,16 +33,62 @@ class ControlCLITests(unittest.TestCase):
         args = Namespace(video="/tmp/video.mp4", speed=1.25)
         with mock.patch.object(control, "validate_video", return_value=Path("/tmp/video.mp4")) as validate:
             with mock.patch.object(control, "update_config", return_value={"video_path": "/tmp/video.mp4", "playback_speed": 1.25}):
-                with mock.patch.object(control, "set_wallpaper_from_video") as set_wallpaper:
-                    with mock.patch.object(control, "start_daemon") as start_daemon:
-                        with mock.patch.object(control, "build_status", return_value={"running": True, "config": {}, "pid": 1, "autostart": False}):
-                            with mock.patch("builtins.print") as printer:
-                                control.command_start(args)
+                with mock.patch.object(control, "daemon_running", return_value=False):
+                    with mock.patch.object(control, "refresh_wallpaper_backup") as refresh_backup:
+                        with mock.patch.object(control, "set_wallpaper_from_video") as set_wallpaper:
+                            with mock.patch.object(control, "start_daemon") as start_daemon:
+                                with mock.patch.object(control, "build_status", return_value={"running": True, "config": {}, "pid": 1, "autostart": False}):
+                                    with mock.patch("builtins.print") as printer:
+                                        control.command_start(args)
 
         validate.assert_called_once()
-        set_wallpaper.assert_called_once()
+        refresh_backup.assert_called_once()
+        set_wallpaper.assert_called_once_with(Path("/tmp/video.mp4"))
         start_daemon.assert_called_once()
         printer.assert_called()
+
+    def test_command_start_skips_backup_refresh_while_daemon_running(self):
+        args = Namespace(video="/tmp/video.mp4", speed=1.25)
+        with mock.patch.object(control, "validate_video", return_value=Path("/tmp/video.mp4")):
+            with mock.patch.object(control, "update_config", return_value={"video_path": "/tmp/video.mp4", "playback_speed": 1.25}):
+                with mock.patch.object(control, "daemon_running", return_value=True):
+                    with mock.patch.object(control, "refresh_wallpaper_backup") as refresh_backup:
+                        with mock.patch.object(control, "set_wallpaper_from_video") as set_wallpaper:
+                            with mock.patch.object(control, "start_daemon") as start_daemon:
+                                with mock.patch.object(control, "build_status", return_value={"running": True, "config": {}, "pid": 1, "autostart": False}):
+                                    with mock.patch("builtins.print"):
+                                        control.command_start(args)
+
+        refresh_backup.assert_not_called()
+        set_wallpaper.assert_called_once_with(Path("/tmp/video.mp4"))
+        start_daemon.assert_called_once()
+
+    def test_command_start_resume_without_video_override_does_not_refresh_managed_frame(self):
+        args = Namespace(video=None, speed=None)
+        config = {
+            "video_path": "/tmp/video.mp4",
+            "playback_speed": 1.0,
+            "volume": 0.0,
+            "blend_interpolation": False,
+            "pause_on_fullscreen": True,
+            "scale_mode": "fill",
+        }
+        with mock.patch.object(control, "load_config", return_value=config):
+            with mock.patch.object(control, "daemon_running", return_value=True):
+                with mock.patch.object(control, "refresh_wallpaper_backup") as refresh_backup:
+                    with mock.patch.object(control, "set_wallpaper_from_video") as set_wallpaper:
+                        with mock.patch.object(control, "start_daemon") as start_daemon:
+                            with mock.patch.object(
+                                control,
+                                "build_status",
+                                return_value={"running": True, "config": config, "pid": 1, "autostart": False},
+                            ):
+                                with mock.patch("builtins.print"):
+                                    control.command_start(args)
+
+        refresh_backup.assert_not_called()
+        set_wallpaper.assert_not_called()
+        start_daemon.assert_called_once_with(wait=0.35)
 
     def test_command_start_without_overrides_uses_resume_path(self):
         args = Namespace(video=None, speed=None)
@@ -55,18 +101,21 @@ class ControlCLITests(unittest.TestCase):
             "scale_mode": "fill",
         }
         with mock.patch.object(control, "load_config", return_value=config):
-            with mock.patch.object(control, "start_daemon") as start_daemon:
-                with mock.patch.object(
-                    control,
-                    "build_status",
-                    return_value={"running": True, "config": config, "pid": 1, "autostart": False},
-                ):
-                    with mock.patch.object(control, "set_wallpaper_from_video") as set_wallpaper:
-                        with mock.patch("builtins.print") as printer:
-                            control.command_start(args)
+            with mock.patch.object(control, "daemon_running", return_value=False):
+                with mock.patch.object(control, "refresh_wallpaper_backup") as refresh_backup:
+                    with mock.patch.object(control, "start_daemon") as start_daemon:
+                        with mock.patch.object(
+                            control,
+                            "build_status",
+                            return_value={"running": True, "config": config, "pid": 1, "autostart": False},
+                        ):
+                            with mock.patch.object(control, "set_wallpaper_from_video") as set_wallpaper:
+                                with mock.patch("builtins.print") as printer:
+                                    control.command_start(args)
 
+        refresh_backup.assert_called_once()
+        set_wallpaper.assert_called_once_with(Path("/tmp/video.mp4"))
         start_daemon.assert_called_once_with(wait=0.35)
-        set_wallpaper.assert_not_called()
         printer.assert_called_once()
 
     def test_command_stop_invokes_manager(self):
@@ -80,17 +129,68 @@ class ControlCLITests(unittest.TestCase):
 
     def test_command_set_video_restarts_daemon(self):
         args = Namespace(video="/tmp/new.mp4")
+        config = {
+            "video_path": "/tmp/new.mp4",
+            "playback_speed": 1.25,
+            "volume": 0.0,
+            "autostart": False,
+            "blend_interpolation": True,
+            "pause_on_fullscreen": False,
+            "scale_mode": "fit",
+        }
         with mock.patch.object(control, "validate_video", return_value=Path("/tmp/new.mp4")):
-            with mock.patch.object(control, "update_config", return_value={"video_path": "/tmp/new.mp4", "playback_speed": 1.0}):
+            with mock.patch.object(control, "update_config", return_value=config):
                 with mock.patch.object(control, "set_wallpaper_from_video", return_value=Path("/tmp/thumb.png")):
                     with mock.patch.object(control, "daemon_running", return_value=True):
                         with mock.patch.object(control, "restart_daemon") as restart:
-                            with mock.patch.object(control, "build_status", return_value={"running": True, "config": {}, "pid": 1, "autostart": False, "wallpaper": ""}):
+                            with mock.patch.object(control, "build_status", return_value={"running": True, "config": config, "pid": 1, "autostart": False, "wallpaper": ""}):
                                 with mock.patch("builtins.print") as printer:
                                     control.command_set_video(args)
 
-        restart.assert_called_once()
+        restart.assert_called_once_with(
+            video_path="/tmp/new.mp4",
+            playback_speed=1.25,
+            volume=0.0,
+            blend_interpolation=True,
+            pause_on_fullscreen=False,
+            scale_mode="fit",
+            wait=0.35,
+        )
         printer.assert_called()
+
+    def test_command_start_with_video_override_preserves_current_settings(self):
+        args = Namespace(video="/tmp/new.mp4", speed=None)
+        config = {
+            "video_path": "/tmp/new.mp4",
+            "playback_speed": 1.1,
+            "volume": 0.0,
+            "autostart": False,
+            "blend_interpolation": True,
+            "pause_on_fullscreen": False,
+            "scale_mode": "stretch",
+        }
+        with mock.patch.object(control, "load_config", return_value=control.DEFAULT_CONFIG.copy()):
+            with mock.patch.object(control, "validate_video", return_value=Path("/tmp/new.mp4")):
+                with mock.patch.object(control, "update_config", return_value=config):
+                    with mock.patch.object(control, "daemon_running", return_value=False):
+                        with mock.patch.object(control, "refresh_wallpaper_backup") as refresh_backup:
+                            with mock.patch.object(control, "set_wallpaper_from_video") as set_wallpaper:
+                                with mock.patch.object(control, "start_daemon") as start_daemon:
+                                    with mock.patch.object(control, "build_status", return_value={"running": True, "config": config, "pid": 1, "autostart": False}):
+                                        with mock.patch("builtins.print"):
+                                            control.command_start(args)
+
+        refresh_backup.assert_called_once()
+        set_wallpaper.assert_called_once_with(Path("/tmp/new.mp4"))
+        start_daemon.assert_called_once_with(
+            video_path="/tmp/new.mp4",
+            playback_speed=1.1,
+            volume=0.0,
+            blend_interpolation=True,
+            pause_on_fullscreen=False,
+            scale_mode="stretch",
+            wait=0.35,
+        )
 
     def test_command_autostart_toggle(self):
         args = Namespace(state="on")
@@ -135,7 +235,7 @@ class ControlCLITests(unittest.TestCase):
         with mock.patch.object(
             control,
             "stop_daemon",
-            side_effect=lambda timeout=1.5: call_order.append("stop"),
+            side_effect=lambda timeout=1.5, preserve_frame=True: call_order.append("stop"),
         ) as stop:
             with mock.patch.object(
                 control,
@@ -145,8 +245,8 @@ class ControlCLITests(unittest.TestCase):
                 with mock.patch.object(control, "build_status", return_value={"running": False, "config": {}, "pid": None, "autostart": False}):
                     with mock.patch("builtins.print") as printer:
                         control.command_clear_wallpaper(args)
-        self.assertEqual(call_order[:2], ["restore", "stop"])
-        stop.assert_called_once_with(timeout=0.35)
+        self.assertEqual(call_order[:2], ["stop", "restore"])
+        stop.assert_called_once_with(timeout=0.6, preserve_frame=False)
         restore.assert_called_once_with(delete_backup=False, allow_fallback=False)
         printer.assert_called_once()
 

@@ -8,8 +8,8 @@ PYTHON_DIR="$ROOT_DIR/python"
 DIST_DIR="$ROOT_DIR/dist"
 APP_TARGET="WallpaperControlApp"
 APP_DISPLAY_NAME="AuraFlow"
-APP_VERSION="${AURAFLOW_VERSION:-1.1.0}"
-APP_BUILD="${AURAFLOW_BUILD:-1}"
+APP_VERSION="${AURAFLOW_VERSION:-1.2.0}"
+APP_BUILD="${AURAFLOW_BUILD:-2}"
 APP_BUNDLE="$DIST_DIR/${APP_DISPLAY_NAME}.app"
 APP_ZIP="$DIST_DIR/${APP_DISPLAY_NAME}.zip"
 APP_DMG="$DIST_DIR/${APP_DISPLAY_NAME}.dmg"
@@ -157,7 +157,7 @@ build_swift_app() {
   <key>CFBundleExecutable</key>
   <string>WallpaperControlApp</string>
   <key>CFBundleIdentifier</key>
-  <string>com.example.auraflow</string>
+  <string>com.andrijvergeles.auraflow</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -200,14 +200,10 @@ apply_plist_customizations() {
   local plist="$APP_BUNDLE/Contents/Info.plist"
   plist_set_string "$plist" CFBundleName "$APP_DISPLAY_NAME"
   plist_set_string "$plist" CFBundleDisplayName "$APP_DISPLAY_NAME"
-  plist_set_string "$plist" CFBundleIdentifier "com.example.auraflow"
+  plist_set_string "$plist" CFBundleIdentifier "com.andrijvergeles.auraflow"
   plist_set_string "$plist" CFBundleShortVersionString "$APP_VERSION"
   plist_set_string "$plist" CFBundleVersion "$APP_BUILD"
   plist_set_bool "$plist" LSUIElement true
-
-  /usr/libexec/PlistBuddy -c "Delete :LSEnvironment" "$plist" 2>/dev/null || true
-  /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$plist"
-  /usr/libexec/PlistBuddy -c "Add :LSEnvironment:PYTHON_EXECUTABLE string /usr/bin/python3" "$plist"
 
   ensure_icon
   cp "$ICON_ICNS" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"

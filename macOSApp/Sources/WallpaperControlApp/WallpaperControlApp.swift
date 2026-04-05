@@ -3,7 +3,6 @@ import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        setenv("PYTHON_EXECUTABLE", "/usr/bin/python3", 1)
         NSApp.setActivationPolicy(.regular)
         NSWindow.allowsAutomaticWindowTabbing = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
@@ -60,7 +59,9 @@ private struct MenuBarControls: View {
 
         Button("Start") {
             guard allowActionAfterMenuOpen else { return }
-            viewModel.start()
+            performMenuBarActionAfterDismiss {
+                viewModel.start()
+            }
         }
         .disabled(!viewModel.canStart)
 
@@ -72,7 +73,9 @@ private struct MenuBarControls: View {
 
         Button("Remove Wallpaper") {
             guard allowActionAfterMenuOpen else { return }
-            viewModel.clearWallpaper()
+            performMenuBarActionAfterDismiss {
+                viewModel.clearWallpaper()
+            }
         }
         .disabled(!viewModel.canClearWallpaper)
 
@@ -121,6 +124,12 @@ private struct MenuBarControls: View {
         openMainWindow()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             viewModel.openCatalogFromMenuBar()
+        }
+    }
+
+    private func performMenuBarActionAfterDismiss(_ action: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            action()
         }
     }
 }

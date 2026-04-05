@@ -21,6 +21,7 @@ from paths import (
     DAEMON_COMMAND_PATH,
     DAEMON_HEALTH_PATH,
     DAEMON_LOCK_PATH,
+    DAEMON_NO_FREEZE_PATH,
     DAEMON_PAUSED_PATH,
     LOG_PATH,
     PID_PATH,
@@ -41,6 +42,10 @@ def _python_executable() -> str:
 
 def _daemon_script() -> Path:
     return Path(__file__).resolve().parent / "wallpaper_daemon.py"
+
+
+def _control_script() -> Path:
+    return Path(__file__).resolve().parent / "control.py"
 
 
 def _python_environment() -> dict[str, str]:
@@ -79,6 +84,14 @@ def _launchctl(args, *, ignore_errors: bool = False) -> bool:
         message = result.stderr.strip() or result.stdout.strip() or "unknown error"
         raise RuntimeError(message)
     return True
+
+
+def _launchctl_domain_target() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def _launchctl_service_target() -> str:
+    return f"{_launchctl_domain_target()}/{APP_ID}"
 
 
 def _launch_signature(
@@ -239,6 +252,17 @@ def _pid_is_alive(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
+    except PermissionError:
+        try:
+            result = subprocess.run(  # noqa: S603
+                ["ps", "-p", str(pid), "-o", "pid="],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return False
+        return result.returncode == 0 and bool(result.stdout.strip())
     except OSError:
         return False
     return True
@@ -569,6 +593,7 @@ def start_daemon(
     wait: float = 0.5,
 ) -> int:
     _cleanup_orphaned_daemons()
+    DAEMON_NO_FREEZE_PATH.unlink(missing_ok=True)
     plain_start = (
         video_path is None
         and playback_speed is None
@@ -612,7 +637,7 @@ def start_daemon(
 
             # Non-plain start is an explicit reconfiguration. Perform one
             # deterministic stop before launch to avoid restart recursion.
-            stop_daemon(timeout=1.5)
+            stop_daemon(timeout=1.5, preserve_frame=(video_path is None))
 
     pid = _launch_daemon(
         config_path,
@@ -643,11 +668,17 @@ def start_daemon(
     return resolved
 
 
-def stop_daemon(timeout: float = 1.5) -> None:
+def stop_daemon(timeout: float = 1.5, preserve_frame: bool = True) -> None:
     """Terminate the daemon process if it is running."""
 
     global _LAST_LAUNCH_SIGNATURE
     _LAST_LAUNCH_SIGNATURE = None
+
+    if preserve_frame:
+        DAEMON_NO_FREEZE_PATH.unlink(missing_ok=True)
+    else:
+        ensure_app_support_dir()
+        DAEMON_NO_FREEZE_PATH.write_text("1", encoding="utf-8")
 
     pid = read_pid()
     lock_pid = _read_lock_pid()
@@ -657,7 +688,7 @@ def stop_daemon(timeout: float = 1.5) -> None:
     if lock_pid is not None:
         active.add(lock_pid)
     _terminate_pids(active, timeout=timeout)
-    for path in (PID_PATH, DAEMON_PAUSED_PATH, DAEMON_COMMAND_PATH, DAEMON_HEALTH_PATH, DAEMON_LOCK_PATH):
+    for path in (PID_PATH, DAEMON_PAUSED_PATH, DAEMON_COMMAND_PATH, DAEMON_NO_FREEZE_PATH, DAEMON_HEALTH_PATH, DAEMON_LOCK_PATH):
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -678,7 +709,7 @@ def restart_daemon(
 ) -> int:
     """Convenience helper to restart the daemon with updated parameters."""
 
-    stop_daemon(timeout=1.5)
+    stop_daemon(timeout=1.5, preserve_frame=(video_path is None))
     return start_daemon(
         config_path=config_path,
         video_path=video_path,
@@ -711,6 +742,7 @@ def daemon_resource_metrics() -> dict:
         "process_count": len(active_pids),
         "cpu_percent": 0.0,
         "memory_mb": 0.0,
+        "virtual_memory_mb": 0.0,
         "thread_count": 0,
         "health": health,
     }
@@ -721,7 +753,7 @@ def daemon_resource_metrics() -> dict:
     ps_targets = ",".join(str(current_pid) for current_pid in active_pids)
     try:
         result = subprocess.run(  # noqa: S603
-            ["ps", "-p", ps_targets, "-o", "pid=,%cpu=,rss="],
+            ["ps", "-p", ps_targets, "-o", "pid=,%cpu=,rss=,vsz="],
             capture_output=True,
             text=True,
             check=False,
@@ -738,22 +770,25 @@ def daemon_resource_metrics() -> dict:
 
     total_cpu = 0.0
     total_memory_mb = 0.0
+    total_virtual_memory_mb = 0.0
     total_threads = 0
     counted = 0
 
     for line in lines:
         parts = line.split()
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
         try:
             current_pid = int(parts[0])
             cpu = float(parts[1])
             memory_mb = float(parts[2]) / 1024.0
+            virtual_memory_mb = float(parts[3]) / 1024.0
         except ValueError:
             continue
 
         total_cpu += cpu
         total_memory_mb += memory_mb
+        total_virtual_memory_mb += virtual_memory_mb
         total_threads += _thread_count_for_pid(current_pid)
         counted += 1
 
@@ -762,6 +797,7 @@ def daemon_resource_metrics() -> dict:
 
     payload["cpu_percent"] = total_cpu
     payload["memory_mb"] = total_memory_mb
+    payload["virtual_memory_mb"] = total_virtual_memory_mb
     payload["thread_count"] = total_threads
     return payload
 
@@ -791,18 +827,19 @@ def _thread_count_for_pid(pid: int) -> int:
 
 
 def _build_launch_agent_plist(config_path: Path) -> dict:
+    _ = config_path
     return {
         "Label": APP_ID,
         "ProgramArguments": [
             _python_executable(),
-            str(_daemon_script()),
-            "--config",
-            str(config_path),
-            "run",
+            str(_control_script()),
+            "start",
         ],
         "EnvironmentVariables": _python_environment(),
+        "WorkingDirectory": str(_control_script().parent),
         "RunAtLoad": True,
         "KeepAlive": False,
+        "ProcessType": "Background",
         "StandardOutPath": str(LOG_PATH),
         "StandardErrorPath": str(LOG_PATH),
     }
@@ -820,10 +857,25 @@ def enable_autostart(config_path: Path = CONFIG_PATH) -> None:
         plistlib.dump(plist, handle)
     plist_path_tmp.replace(AGENT_PLIST_PATH)
 
+    domain_target = _launchctl_domain_target()
+    service_target = _launchctl_service_target()
+    plist_path = str(AGENT_PLIST_PATH)
+    _launchctl(["bootout", domain_target, plist_path], ignore_errors=True)
+    loaded = _launchctl(["bootstrap", domain_target, plist_path], ignore_errors=True)
+    if not loaded:
+        loaded = _launchctl(["load", "-w", plist_path], ignore_errors=True)
+    if loaded:
+        _launchctl(["enable", service_target], ignore_errors=True)
+        _launchctl(["kickstart", "-k", service_target], ignore_errors=True)
+
 
 def disable_autostart() -> None:
     """Remove the LaunchAgent plist and unload."""
 
+    domain_target = _launchctl_domain_target()
+    service_target = _launchctl_service_target()
+    _launchctl(["bootout", service_target], ignore_errors=True)
+    _launchctl(["bootout", domain_target, str(AGENT_PLIST_PATH)], ignore_errors=True)
     if AGENT_PLIST_PATH.exists():
         _launchctl(["unload", str(AGENT_PLIST_PATH)], ignore_errors=True)
         AGENT_PLIST_PATH.unlink(missing_ok=True)

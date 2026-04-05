@@ -28,7 +28,12 @@ from daemon_manager import (
     daemon_running,
 )
 from paths import CONFIG_PATH, ensure_app_support_dir
-from wallpaper_utils import restore_wallpaper_backup, set_wallpaper_from_video, validate_video
+from wallpaper_utils import (
+    refresh_wallpaper_backup,
+    restore_wallpaper_backup,
+    set_wallpaper_from_video,
+    validate_video,
+)
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -87,13 +92,19 @@ def command_start(args):
     if args.video:
         video_path = str(validate_video(args.video))
         config = update_config({"video_path": video_path}, CONFIG_PATH)
-        set_wallpaper_from_video(Path(video_path))
         overrides_applied = True
     if args.speed is not None:
         config = update_config({"playback_speed": args.speed}, CONFIG_PATH)
         overrides_applied = True
     if not config["video_path"]:
         raise SystemExit("No video configured. Use 'set-video' first or pass --video.")
+
+    should_refresh_backup = not daemon_running()
+    if should_refresh_backup:
+        refresh_wallpaper_backup()
+
+    if should_refresh_backup or args.video:
+        set_wallpaper_from_video(Path(config["video_path"]))
 
     if overrides_applied:
         start_daemon(
@@ -199,13 +210,11 @@ def command_set_scale(args):
 
 
 def command_clear_wallpaper(_args):
+    stop_daemon(timeout=0.6, preserve_frame=False)
     restored = restore_wallpaper_backup(
         delete_backup=False,
         allow_fallback=False,
     )
-    # Restore user wallpaper first to avoid a visible desktop flicker while
-    # daemon teardown finishes.
-    stop_daemon(timeout=0.35)
     payload = build_status()
     payload["wallpaper_restored"] = restored
     print(json.dumps(payload))
