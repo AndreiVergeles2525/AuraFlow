@@ -25,7 +25,10 @@ let package = Package(
         .testTarget(
             name: "WallpaperControlAppTests",
             dependencies: ["WallpaperControlApp"],
-            path: "Tests/WallpaperControlAppTests"
+            path: "Tests/WallpaperControlAppTests",
+            resources: [
+                .process("Fixtures")
+            ]
         )
     ]
 )

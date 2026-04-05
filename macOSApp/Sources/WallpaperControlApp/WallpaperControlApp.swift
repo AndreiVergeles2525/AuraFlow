@@ -1,14 +1,12 @@
 import AppKit
 import SwiftUI
-import Darwin
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        setenv("PYTHON_EXECUTABLE", "/usr/bin/python3", 1)
         NSApp.setActivationPolicy(.regular)
         NSWindow.allowsAutomaticWindowTabbing = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            _ = bringMainWindowToFront()
+            bringMainWindowToFront()
         }
     }
 
@@ -17,7 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        _ = bringMainWindowToFront()
+        bringMainWindowToFront()
         return true
     }
 }
@@ -30,12 +28,14 @@ struct WallpaperControlApp: App {
     @StateObject private var viewModel = AppViewModel()
 
     var body: some Scene {
-        WindowGroup(id: Self.mainWindowID) {
+        Window("AuraFlow", id: Self.mainWindowID) {
             ContentView(viewModel: viewModel)
         }
         .defaultSize(width: preferredWindowSize().width, height: preferredWindowSize().height)
         .windowStyle(.hiddenTitleBar)
-        .windowToolbarStyle(.unified)
+        .commands {
+            CommandGroup(replacing: .newItem) {}
+        }
 
         MenuBarExtra {
             MenuBarControls(viewModel: viewModel)
@@ -59,7 +59,9 @@ private struct MenuBarControls: View {
 
         Button("Start") {
             guard allowActionAfterMenuOpen else { return }
-            viewModel.start()
+            performMenuBarActionAfterDismiss {
+                viewModel.start()
+            }
         }
         .disabled(!viewModel.canStart)
 
@@ -71,7 +73,9 @@ private struct MenuBarControls: View {
 
         Button("Remove Wallpaper") {
             guard allowActionAfterMenuOpen else { return }
-            viewModel.clearWallpaper()
+            performMenuBarActionAfterDismiss {
+                viewModel.clearWallpaper()
+            }
         }
         .disabled(!viewModel.canClearWallpaper)
 
@@ -101,12 +105,11 @@ private struct MenuBarControls: View {
     }
 
     private func openMainWindow() {
-        if bringMainWindowToFront() {
-            return
+        if NSApp.windows.first(where: { $0.identifier == auraFlowMainWindowIdentifier }) == nil {
+            openWindow(id: WallpaperControlApp.mainWindowID)
         }
-        openWindow(id: WallpaperControlApp.mainWindowID)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            _ = bringMainWindowToFront()
+            bringMainWindowToFront()
         }
     }
 
@@ -121,6 +124,12 @@ private struct MenuBarControls: View {
         openMainWindow()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             viewModel.openCatalogFromMenuBar()
+        }
+    }
+
+    private func performMenuBarActionAfterDismiss(_ action: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            action()
         }
     }
 }

@@ -3,20 +3,29 @@
 .swiftpm/
 .build/
 DerivedData/
+/.build-lock/
 
 # Python
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
 
 # Distribution artifacts
 dist/
 build/
 .build-venv/
+.build-venv-*/
 
 # Logs / temp
 *.log
 *.tmp
+*.pid
+*.swp
+
+# Local app/runtime state
+/Library/
+*.dSYM/
 
 # IDE
 .idea/

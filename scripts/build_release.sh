@@ -8,17 +8,31 @@ PYTHON_DIR="$ROOT_DIR/python"
 DIST_DIR="$ROOT_DIR/dist"
 APP_TARGET="WallpaperControlApp"
 APP_DISPLAY_NAME="AuraFlow"
-APP_VERSION="${AURAFLOW_VERSION:-1.1.0}"
-APP_BUILD="${AURAFLOW_BUILD:-1}"
+APP_VERSION="${AURAFLOW_VERSION:-1.2.0}"
+APP_BUILD="${AURAFLOW_BUILD:-2}"
 APP_BUNDLE="$DIST_DIR/${APP_DISPLAY_NAME}.app"
 APP_ZIP="$DIST_DIR/${APP_DISPLAY_NAME}.zip"
 APP_DMG="$DIST_DIR/${APP_DISPLAY_NAME}.dmg"
 ICON_PNG="$ROOT_DIR/Resources/AppIcon.png"
 ICON_ICNS="$ROOT_DIR/Resources/AppIcon.icns"
 PYTHON_BIN="${PYTHON_BUILD_PYTHON:-/usr/bin/python3}"
+BUILD_UNIVERSAL="${BUILD_UNIVERSAL:-1}"
+LOCK_DIR="$ROOT_DIR/.build-lock"
 
 log() {
   printf '[build] %s\n' "$1"
+}
+
+cleanup_lock() {
+  rm -rf "$LOCK_DIR"
+}
+
+acquire_lock() {
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    log "Another build is already running. Stop it first or remove $LOCK_DIR"
+    exit 1
+  fi
+  trap cleanup_lock EXIT
 }
 
 plist_set_string() {
@@ -85,19 +99,24 @@ build_swift_app() {
   local arm_binary="$SWIFT_DIR/.build/arm64-apple-macosx/release/${APP_TARGET}"
   local x86_binary="$SWIFT_DIR/.build/x86_64-apple-macosx/release/${APP_TARGET}"
   local universal_dir="$SWIFT_DIR/.build/universal"
+  local built_x86="0"
 
-  if command -v arch >/dev/null 2>&1; then
-    if arch -x86_64 swift build -c release >/dev/null 2>&1; then
+  if [[ "$BUILD_UNIVERSAL" == "1" ]] && command -v arch >/dev/null 2>&1; then
+    log "Building x86_64 slice (Rosetta may be required)"
+    if arch -x86_64 swift build -c release; then
       log "Built x86_64 slice"
+      built_x86="1"
     else
-      log "[warn] Failed to build x86_64 slice (Rosetta required). Using arm64 only."
+      log "[warn] Failed to build x86_64 slice. Using arm64 only."
     fi
+  elif [[ "$BUILD_UNIVERSAL" != "1" ]]; then
+    log "Skipping x86_64 build (BUILD_UNIVERSAL=$BUILD_UNIVERSAL)"
   else
     log "[warn] 'arch' command not found; building arm64 slice only."
   fi
 
   local bin_path
-  if [[ -f "$arm_binary" && -f "$x86_binary" ]]; then
+  if [[ "$built_x86" == "1" && -f "$arm_binary" && -f "$x86_binary" ]]; then
     mkdir -p "$universal_dir"
     lipo -create -output "$universal_dir/${APP_TARGET}" "$arm_binary" "$x86_binary"
     bin_path="$universal_dir"
@@ -138,7 +157,7 @@ build_swift_app() {
   <key>CFBundleExecutable</key>
   <string>WallpaperControlApp</string>
   <key>CFBundleIdentifier</key>
-  <string>com.example.auraflow</string>
+  <string>com.andrijvergeles.auraflow</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -166,11 +185,12 @@ sync_python_payload() {
 
   if [[ -f "$PYTHON_DIR/requirements.txt" ]]; then
     log "Vendoring Python dependencies"
-    local venv="$ROOT_DIR/.build-venv"
+    local venv="$ROOT_DIR/.build-venv-$$"
+    rm -rf "$venv"
     "$PYTHON_BIN" -m venv "$venv"
     source "$venv/bin/activate"
-    pip install --upgrade pip >/dev/null
-    pip install -r "$PYTHON_DIR/requirements.txt" --target "$py_dir/site-packages" >/dev/null
+    python -m pip install --upgrade pip
+    python -m pip install --prefer-binary -r "$PYTHON_DIR/requirements.txt" --target "$py_dir/site-packages"
     deactivate
     rm -rf "$venv"
   fi
@@ -180,14 +200,10 @@ apply_plist_customizations() {
   local plist="$APP_BUNDLE/Contents/Info.plist"
   plist_set_string "$plist" CFBundleName "$APP_DISPLAY_NAME"
   plist_set_string "$plist" CFBundleDisplayName "$APP_DISPLAY_NAME"
-  plist_set_string "$plist" CFBundleIdentifier "com.example.auraflow"
+  plist_set_string "$plist" CFBundleIdentifier "com.andrijvergeles.auraflow"
   plist_set_string "$plist" CFBundleShortVersionString "$APP_VERSION"
   plist_set_string "$plist" CFBundleVersion "$APP_BUILD"
   plist_set_bool "$plist" LSUIElement true
-
-  /usr/libexec/PlistBuddy -c "Delete :LSEnvironment" "$plist" 2>/dev/null || true
-  /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$plist"
-  /usr/libexec/PlistBuddy -c "Add :LSEnvironment:PYTHON_EXECUTABLE string /usr/bin/python3" "$plist"
 
   ensure_icon
   cp "$ICON_ICNS" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
@@ -216,6 +232,7 @@ package_distribution() {
 }
 
 main() {
+  acquire_lock
   prepare_environment
   build_swift_app
   sync_python_payload

@@ -1,30 +1,51 @@
 import AppKit
 
 let auraFlowMainWindowIdentifier = NSUserInterfaceItemIdentifier("AuraFlowMainWindow")
-
-private final class AuraFlowMainWindowDelegate: NSObject, NSWindowDelegate {
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        sender.orderOut(nil)
-        return false
-    }
-}
-
-private let auraFlowMainWindowDelegate = AuraFlowMainWindowDelegate()
+private var auraFlowStoredWindowFrames: [ObjectIdentifier: NSRect] = [:]
 
 func configureWindowForClientDecorations(_ window: NSWindow) {
     window.identifier = auraFlowMainWindowIdentifier
-    window.isReleasedWhenClosed = false
-    window.delegate = auraFlowMainWindowDelegate
+    window.animationBehavior = .none
     window.tabbingMode = .disallowed
     window.titleVisibility = .hidden
     window.titlebarAppearsTransparent = true
+    window.styleMask.insert(.titled)
+    window.styleMask.insert(.closable)
+    window.styleMask.insert(.miniaturizable)
+    window.styleMask.insert(.resizable)
     window.styleMask.insert(.fullSizeContentView)
-    window.isMovableByWindowBackground = true
+    window.isMovableByWindowBackground = false
     window.isOpaque = false
     window.backgroundColor = .clear
-    window.standardWindowButton(.closeButton)?.isHidden = false
-    window.standardWindowButton(.miniaturizeButton)?.isHidden = false
-    window.standardWindowButton(.zoomButton)?.isHidden = false
+    applyStandardWindowButtonAppearance(for: window)
+}
+
+func applyStandardWindowButtonAppearance(for window: NSWindow) {
+    let buttonColors: [(NSWindow.ButtonType, NSColor)] = [
+        (.closeButton, NSColor(srgbRed: 1.0, green: 95.0 / 255.0, blue: 87.0 / 255.0, alpha: 1.0)),
+        (.miniaturizeButton, NSColor(srgbRed: 1.0, green: 189.0 / 255.0, blue: 46.0 / 255.0, alpha: 1.0)),
+        (.zoomButton, NSColor(srgbRed: 40.0 / 255.0, green: 205.0 / 255.0, blue: 65.0 / 255.0, alpha: 1.0))
+    ]
+    for (buttonType, color) in buttonColors {
+        guard let button = window.standardWindowButton(buttonType) else { continue }
+        button.isHidden = false
+        button.alphaValue = 1.0
+        button.wantsLayer = true
+        button.isBordered = false
+        button.image = nil
+        button.alternateImage = nil
+        button.contentTintColor = .clear
+        button.bezelColor = .clear
+        button.layer?.shadowOpacity = 0
+        button.layer?.backgroundColor = color.cgColor
+        button.layer?.cornerRadius = max(button.bounds.height * 0.5, 0)
+        button.layer?.masksToBounds = true
+        button.layer?.borderWidth = 0
+        if #available(macOS 10.14, *) {
+            button.appearance = NSAppearance(named: .aqua)
+        }
+        button.needsDisplay = true
+    }
 }
 
 func mainScreenAspectRatio() -> CGFloat {
@@ -41,13 +62,12 @@ func preferredWindowSize() -> CGSize {
     return CGSize(width: width, height: height)
 }
 
-@discardableResult
-func bringMainWindowToFront() -> Bool {
+func bringMainWindowToFront() {
     NSApp.activate(ignoringOtherApps: true)
 
     let targetWindow = NSApp.windows.first { $0.identifier == auraFlowMainWindowIdentifier }
     guard let window = targetWindow ?? NSApp.windows.first else {
-        return false
+        return
     }
 
     if window.isMiniaturized {
@@ -56,5 +76,24 @@ func bringMainWindowToFront() -> Bool {
 
     window.makeKeyAndOrderFront(nil)
     window.orderFrontRegardless()
-    return true
+}
+
+func toggleFastWindowZoom(_ window: NSWindow) {
+    let windowID = ObjectIdentifier(window)
+    let targetFrame: NSRect
+
+    if let restoredFrame = auraFlowStoredWindowFrames.removeValue(forKey: windowID) {
+        targetFrame = restoredFrame
+    } else {
+        let currentFrame = window.frame
+        let targetVisibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame ?? currentFrame
+        let needsZoom = !currentFrame.equalTo(targetVisibleFrame)
+
+        guard needsZoom else { return }
+
+        auraFlowStoredWindowFrames[windowID] = currentFrame
+        targetFrame = targetVisibleFrame
+    }
+
+    window.setFrame(targetFrame, display: false, animate: true)
 }

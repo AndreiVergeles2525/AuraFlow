@@ -17,10 +17,8 @@ import AppKit
     #expect(window.styleMask.contains(.fullSizeContentView))
     #expect(window.isOpaque == false)
     #expect(window.backgroundColor == .clear)
+    #expect(window.animationBehavior == .none)
     #expect((window.standardWindowButton(.closeButton)?.isHidden ?? true) == false)
     #expect((window.standardWindowButton(.miniaturizeButton)?.isHidden ?? true) == false)
     #expect((window.standardWindowButton(.zoomButton)?.isHidden ?? true) == false)
-
-    let shouldClose = window.delegate?.windowShouldClose?(window) ?? true
-    #expect(shouldClose == false)
 }

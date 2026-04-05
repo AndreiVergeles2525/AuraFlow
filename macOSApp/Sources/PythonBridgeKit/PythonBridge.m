@@ -71,9 +71,14 @@ static NSError *PythonBridgeLastError = nil;
 
 - (NSString *)resolvePythonExecutable {
     NSString *envOverride = [[[NSProcessInfo processInfo] environment] objectForKey:@"PYTHON_EXECUTABLE"];
-    if (envOverride.length > 0 && [[NSFileManager defaultManager] isExecutableFileAtPath:envOverride]) {
-        return envOverride;
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    if (envOverride.length > 0) {
+        [candidates addObject:envOverride];
     }
+
+    // Prefer system/CLT Python because it is the most likely to have compatible PyObjC.
+    [candidates addObject:@"/usr/bin/python3"];
+    [candidates addObject:@"/Library/Developer/CommandLineTools/usr/bin/python3"];
 
     NSPipe *outputPipe = [NSPipe pipe];
     NSTask *whichTask = [[NSTask alloc] init];
@@ -84,21 +89,64 @@ static NSError *PythonBridgeLastError = nil;
 
     @try {
         [whichTask launch];
+        [whichTask waitUntilExit];
     } @catch (NSException *exception) {
         [self recordErrorWithCode:101 description:exception.reason ?: @"Failed to locate python3 interpreter."];
         return nil;
     }
 
-    [whichTask waitUntilExit];
     NSData *data = [[outputPipe fileHandleForReading] readDataToEndOfFile];
-    NSString *path = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-
-    if (whichTask.terminationStatus != 0 || path.length == 0) {
-        [self recordErrorWithCode:102 description:@"python3 interpreter not found. Install Python 3 with PyObjC."];
-        return nil;
+    NSString *resolvedFromPath = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (whichTask.terminationStatus == 0 && resolvedFromPath.length > 0) {
+        [candidates addObject:resolvedFromPath];
     }
 
-    return path;
+    NSMutableOrderedSet<NSString *> *uniqueCandidates = [NSMutableOrderedSet orderedSet];
+    for (NSString *candidate in candidates) {
+        if (candidate.length > 0) {
+            [uniqueCandidates addObject:candidate];
+        }
+    }
+
+    NSString *lastError = @"";
+    for (NSString *candidate in uniqueCandidates) {
+        if (![[NSFileManager defaultManager] isExecutableFileAtPath:candidate]) {
+            continue;
+        }
+
+        NSPipe *stderrPipe = [NSPipe pipe];
+        NSTask *task = [[NSTask alloc] init];
+        task.launchPath = @"/usr/bin/env";
+        task.arguments = @[candidate, @"-c", @"import objc"];
+        task.standardError = stderrPipe;
+        task.environment = [self pythonEnvironment];
+
+        @try {
+            [task launch];
+            [task waitUntilExit];
+        } @catch (NSException *exception) {
+            lastError = exception.reason ?: @"Failed to launch candidate python interpreter.";
+            continue;
+        }
+
+        if (task.terminationStatus == 0) {
+            return candidate;
+        }
+
+        NSData *stderrData = [[stderrPipe fileHandleForReading] readDataToEndOfFile];
+        NSString *stderrString = [[NSString alloc] initWithData:stderrData encoding:NSUTF8StringEncoding] ?: @"";
+        if (stderrString.length > 0) {
+            lastError = stderrString;
+        }
+    }
+
+    NSString *message = @"python3 interpreter not found with PyObjC support.";
+    if (lastError.length > 0) {
+        message = [NSString stringWithFormat:@"%@ %@", message, lastError];
+    }
+    [self recordErrorWithCode:102 description:message];
+    return nil;
 }
 
 - (NSDictionary<NSString *, NSString *> *)pythonEnvironment {
