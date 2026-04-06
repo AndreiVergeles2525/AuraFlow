@@ -40,6 +40,30 @@ def _python_executable() -> str:
     return os.environ.get("PYTHON_EXECUTABLE") or sys.executable
 
 
+def _python_home(executable: Optional[str] = None) -> Optional[str]:
+    """Return the bundled framework version directory when available."""
+
+    candidate = executable or _python_executable()
+    if not candidate:
+        return os.environ.get("PYTHONHOME")
+
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=False)
+    except OSError:
+        return os.environ.get("PYTHONHOME")
+
+    parts = resolved.parts
+    try:
+        versions_index = parts.index("Versions")
+    except ValueError:
+        return os.environ.get("PYTHONHOME")
+
+    if versions_index + 1 >= len(parts):
+        return os.environ.get("PYTHONHOME")
+
+    return str(Path(*parts[:versions_index + 2]))
+
+
 def _daemon_script() -> Path:
     return Path(__file__).resolve().parent / "wallpaper_daemon.py"
 
@@ -48,9 +72,23 @@ def _control_script() -> Path:
     return Path(__file__).resolve().parent / "control.py"
 
 
+def _bundled_binary_executable(name: str, origin: Optional[Path] = None) -> Optional[str]:
+    current = (origin or _daemon_script()).expanduser().resolve(strict=False)
+    for parent in (current.parent, *current.parents):
+        candidate = parent / "bin" / name
+        if os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def _python_environment() -> dict[str, str]:
+    executable = _python_executable()
+    python_home = _python_home(executable)
     script_dir = str(_daemon_script().parent)
     site_packages_dir = str(_daemon_script().parent / "site-packages")
+    bundled_ffmpeg = _bundled_binary_executable("ffmpeg")
+    bundled_ffprobe = _bundled_binary_executable("ffprobe")
+    bundled_bin_dir = str(Path(bundled_ffmpeg).parent) if bundled_ffmpeg else None
 
     python_paths: list[str] = [script_dir]
     if Path(site_packages_dir).exists():
@@ -61,13 +99,37 @@ def _python_environment() -> dict[str, str]:
         python_paths.append(existing)
 
     env: dict[str, str] = {}
-    for key in ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR"):
+    for key in (
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "PYTHONHOME",
+        "PYTHONNOUSERSITE",
+        "PYTHONDONTWRITEBYTECODE",
+    ):
         value = os.environ.get(key)
         if value:
             env[key] = value
 
+    if python_home:
+        env["PYTHONHOME"] = python_home
+    env["PYTHON_EXECUTABLE"] = executable
     env["PYTHONPATH"] = ":".join(python_paths)
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if bundled_ffmpeg:
+        env["AURAFLOW_FFMPEG_PATH"] = bundled_ffmpeg
+    if bundled_ffprobe:
+        env["AURAFLOW_FFPROBE_PATH"] = bundled_ffprobe
+    if bundled_bin_dir:
+        existing_path = env.get("PATH") or os.environ.get("PATH") or ""
+        path_entries = [bundled_bin_dir]
+        if existing_path:
+            path_entries.append(existing_path)
+        env["PATH"] = ":".join(path_entries)
     return env
 
 
