@@ -6,6 +6,7 @@ static NSError *PythonBridgeLastError = nil;
 
 @property(nonatomic, strong) NSString *scriptPath;
 @property(nonatomic, strong) NSString *pythonExecutable;
+@property(nonatomic, strong, nullable) NSString *pythonHome;
 
 @end
 
@@ -29,6 +30,7 @@ static NSError *PythonBridgeLastError = nil;
         if (!_pythonExecutable) {
             return nil;
         }
+        _pythonHome = [self pythonHomeForExecutable:_pythonExecutable];
 
         if (![self validatePythonEnvironment]) {
             return nil;
@@ -76,6 +78,11 @@ static NSError *PythonBridgeLastError = nil;
         [candidates addObject:envOverride];
     }
 
+    NSString *bundledExecutable = [self bundledPythonExecutable];
+    if (bundledExecutable.length > 0) {
+        [candidates addObject:bundledExecutable];
+    }
+
     // Prefer system/CLT Python because it is the most likely to have compatible PyObjC.
     [candidates addObject:@"/usr/bin/python3"];
     [candidates addObject:@"/Library/Developer/CommandLineTools/usr/bin/python3"];
@@ -120,7 +127,7 @@ static NSError *PythonBridgeLastError = nil;
         task.launchPath = @"/usr/bin/env";
         task.arguments = @[candidate, @"-c", @"import objc"];
         task.standardError = stderrPipe;
-        task.environment = [self pythonEnvironment];
+        task.environment = [self pythonEnvironmentForExecutable:candidate];
 
         @try {
             [task launch];
@@ -149,7 +156,79 @@ static NSError *PythonBridgeLastError = nil;
     return nil;
 }
 
-- (NSDictionary<NSString *, NSString *> *)pythonEnvironment {
+- (nullable NSString *)bundledPythonExecutable {
+    NSBundle *bundle = [NSBundle mainBundle];
+    NSString *frameworksPath = bundle.privateFrameworksPath;
+    if (frameworksPath.length == 0) {
+        return nil;
+    }
+
+    NSString *candidate = [frameworksPath stringByAppendingPathComponent:@"Python3.framework/Versions/Current/bin/python3"];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:candidate]) {
+        return candidate;
+    }
+
+    candidate = [frameworksPath stringByAppendingPathComponent:@"Python3.framework/Versions/3.9/bin/python3"];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:candidate]) {
+        return candidate;
+    }
+
+    return nil;
+}
+
+- (nullable NSString *)bundledResourcesBinDirectory {
+    NSBundle *bundle = [NSBundle mainBundle];
+    NSString *resourcePath = bundle.resourcePath;
+    if (resourcePath.length == 0) {
+        return nil;
+    }
+
+    NSString *candidate = [resourcePath stringByAppendingPathComponent:@"bin"];
+    BOOL isDirectory = NO;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:candidate isDirectory:&isDirectory] && isDirectory) {
+        return candidate;
+    }
+
+    return nil;
+}
+
+- (nullable NSString *)bundledToolExecutableNamed:(NSString *)name {
+    NSString *binDirectory = [self bundledResourcesBinDirectory];
+    if (binDirectory.length == 0 || name.length == 0) {
+        return nil;
+    }
+
+    NSString *candidate = [binDirectory stringByAppendingPathComponent:name];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:candidate]) {
+        return candidate;
+    }
+
+    return nil;
+}
+
+- (nullable NSString *)pythonHomeForExecutable:(NSString *)executable {
+    if (executable.length == 0) {
+        return nil;
+    }
+
+    NSURL *executableURL = [NSURL fileURLWithPath:executable];
+    NSURL *resolvedURL = [executableURL URLByResolvingSymlinksInPath];
+    NSString *resolvedPath = resolvedURL.path;
+    if (resolvedPath.length == 0) {
+        resolvedPath = executable;
+    }
+
+    NSArray<NSString *> *parts = [resolvedPath pathComponents];
+    NSUInteger versionsIndex = [parts indexOfObject:@"Versions"];
+    if (versionsIndex == NSNotFound || versionsIndex + 1 >= parts.count) {
+        return nil;
+    }
+
+    NSArray<NSString *> *homeParts = [parts subarrayWithRange:NSMakeRange(0, versionsIndex + 2)];
+    return [NSString pathWithComponents:homeParts];
+}
+
+- (NSDictionary<NSString *, NSString *> *)pythonEnvironmentForExecutable:(NSString *)executable {
     NSMutableDictionary *env = [[[NSProcessInfo processInfo] environment] mutableCopy];
     NSString *scriptDir = [self.scriptPath stringByDeletingLastPathComponent];
     NSString *sitePackages = [scriptDir stringByAppendingPathComponent:@"site-packages"];
@@ -167,9 +246,42 @@ static NSError *PythonBridgeLastError = nil;
         [pythonPaths addObject:existing];
     }
 
+    NSString *pythonHome = [self pythonHomeForExecutable:executable];
+    if (pythonHome.length > 0) {
+        env[@"PYTHONHOME"] = pythonHome;
+    } else {
+        [env removeObjectForKey:@"PYTHONHOME"];
+    }
+
+    if (executable.length > 0) {
+        env[@"PYTHON_EXECUTABLE"] = executable;
+    }
+    NSString *bundledFFmpeg = [self bundledToolExecutableNamed:@"ffmpeg"];
+    if (bundledFFmpeg.length > 0) {
+        env[@"AURAFLOW_FFMPEG_PATH"] = bundledFFmpeg;
+    }
+    NSString *bundledFFprobe = [self bundledToolExecutableNamed:@"ffprobe"];
+    if (bundledFFprobe.length > 0) {
+        env[@"AURAFLOW_FFPROBE_PATH"] = bundledFFprobe;
+    }
+    NSString *bundledBinDirectory = [self bundledResourcesBinDirectory];
+    if (bundledBinDirectory.length > 0) {
+        NSString *existingPath = env[@"PATH"] ?: @"";
+        if (existingPath.length > 0) {
+            env[@"PATH"] = [NSString stringWithFormat:@"%@:%@", bundledBinDirectory, existingPath];
+        } else {
+            env[@"PATH"] = bundledBinDirectory;
+        }
+    }
     env[@"PYTHONPATH"] = [pythonPaths componentsJoinedByString:@":"];
     env[@"PYTHONUNBUFFERED"] = @"1";
+    env[@"PYTHONNOUSERSITE"] = @"1";
+    env[@"PYTHONDONTWRITEBYTECODE"] = @"1";
     return env;
+}
+
+- (NSDictionary<NSString *, NSString *> *)pythonEnvironment {
+    return [self pythonEnvironmentForExecutable:self.pythonExecutable];
 }
 
 - (BOOL)validatePythonEnvironment {

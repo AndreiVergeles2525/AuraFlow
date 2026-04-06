@@ -196,6 +196,20 @@ class WallpaperUtilsTests(unittest.TestCase):
             self.assertEqual(result, output)
             self.assertTrue(output.exists())
 
+    def test_bundled_binary_executable_resolves_from_app_resources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            script_path = temp_root / "AuraFlow.app" / "Contents" / "Resources" / "Python" / "wallpaper_utils.py"
+            bundled_bin = temp_root / "AuraFlow.app" / "Contents" / "Resources" / "bin"
+            bundled_bin.mkdir(parents=True)
+            ffmpeg = bundled_bin / "ffmpeg"
+            ffmpeg.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            ffmpeg.chmod(0o755)
+
+            resolved = wallpaper_utils._bundled_binary_executable("ffmpeg", origin=script_path)
+
+        self.assertEqual(resolved, str(ffmpeg.resolve(strict=False)))
+
     def test_set_wallpaper_applies_to_all_desktops_via_system_events(self):
         image_path = Path("/tmp/frame.png")
         fake_screen = object()

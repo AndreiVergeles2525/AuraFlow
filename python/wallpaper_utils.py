@@ -562,6 +562,9 @@ def _ffmpeg_candidate_executables() -> list[str]:
     candidates: list[str] = []
     if env_value:
         candidates.append(env_value)
+    bundled = _bundled_binary_executable("ffmpeg")
+    if bundled:
+        candidates.append(bundled)
     candidates.extend(
         [
             "/opt/homebrew/bin/ffmpeg",
@@ -573,6 +576,15 @@ def _ffmpeg_candidate_executables() -> list[str]:
     if from_path:
         candidates.append(from_path)
     return candidates
+
+
+def _bundled_binary_executable(name: str, origin: str | Path | None = None) -> str | None:
+    current = Path(origin or __file__).expanduser().resolve(strict=False)
+    for parent in (current.parent, *current.parents):
+        candidate = parent / "bin" / name
+        if os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
 
 
 def _resolve_ffmpeg_executable() -> str | None:

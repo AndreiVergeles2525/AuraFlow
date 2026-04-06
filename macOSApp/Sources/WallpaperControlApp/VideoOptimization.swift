@@ -83,6 +83,21 @@ struct VideoOptimizationResult {
     let fromCache: Bool
 }
 
+func auraFlowBundledToolExecutable(
+    named name: String,
+    resourcesURL: URL? = Bundle.main.resourceURL
+) -> String? {
+    guard let resourcesURL else { return nil }
+    let candidate = resourcesURL
+        .appendingPathComponent("bin", isDirectory: true)
+        .appendingPathComponent(name)
+        .path
+    guard FileManager.default.isExecutableFile(atPath: candidate) else {
+        return nil
+    }
+    return candidate
+}
+
 enum VideoOptimizerError: LocalizedError {
     case exportUnavailable
     case exportFailed(String)
@@ -656,6 +671,9 @@ final class VideoOptimizer {
         var candidates: [String] = []
         if !env.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             candidates.append(env)
+        }
+        if let bundled = auraFlowBundledToolExecutable(named: "ffmpeg") {
+            candidates.append(bundled)
         }
         candidates.append(contentsOf: [
             "/opt/homebrew/bin/ffmpeg",

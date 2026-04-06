@@ -140,6 +140,40 @@ class DaemonManagerTests(unittest.TestCase):
         self.assertIn(b"control.py", payload)
         self.assertIn(b"<string>start</string>", payload)
 
+    def test_python_environment_prefers_bundled_framework_runtime(self):
+        executable = (
+            "/Applications/AuraFlow.app/Contents/Frameworks/"
+            "Python3.framework/Versions/3.9/bin/python3"
+        )
+        bundled_ffmpeg = "/Applications/AuraFlow.app/Contents/Resources/bin/ffmpeg"
+        bundled_ffprobe = "/Applications/AuraFlow.app/Contents/Resources/bin/ffprobe"
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(daemon_manager, "_python_executable", return_value=executable):
+                with mock.patch.object(
+                    daemon_manager,
+                    "_bundled_binary_executable",
+                    side_effect=lambda name, origin=None: bundled_ffmpeg if name == "ffmpeg" else bundled_ffprobe,
+                ):
+                    env = daemon_manager._python_environment()
+
+        self.assertEqual(env["PYTHON_EXECUTABLE"], executable)
+        self.assertEqual(
+            env["PYTHONHOME"],
+            "/Applications/AuraFlow.app/Contents/Frameworks/Python3.framework/Versions/3.9",
+        )
+        self.assertEqual(env["PYTHONNOUSERSITE"], "1")
+        self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(env["AURAFLOW_FFMPEG_PATH"], bundled_ffmpeg)
+        self.assertEqual(env["AURAFLOW_FFPROBE_PATH"], bundled_ffprobe)
+        self.assertTrue(env["PATH"].startswith("/Applications/AuraFlow.app/Contents/Resources/bin"))
+
+    def test_python_home_falls_back_to_existing_env_for_non_framework_runtime(self):
+        with mock.patch.dict(os.environ, {"PYTHONHOME": "/tmp/custom-python-home"}, clear=True):
+            home = daemon_manager._python_home("/usr/local/bin/python3")
+
+        self.assertEqual(home, "/tmp/custom-python-home")
+
     def test_enable_autostart_loads_agent_into_current_session(self):
         agent_dir = Path(self.temp_dir.name) / "LaunchAgents"
         agent_dir.mkdir()

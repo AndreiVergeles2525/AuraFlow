@@ -55,7 +55,7 @@ When AuraFlow starts, it saves the user's current non-AuraFlow wallpaper state. 
 
 Optional:
 
-- `ffmpeg` for some advanced video conversion paths
+- `ffmpeg` for WebM/AV1 and some advanced video conversion paths
 - macOS 26 or later for the Liquid Glass visual effect
 
 ## Install
@@ -153,8 +153,11 @@ BUILD_UNIVERSAL=1 PYTHON_BUILD_PYTHON=/usr/bin/python3 ./build_app.sh
 ### The build looks stuck after Swift finishes
 The packaging step installs vendored Python dependencies. That can take time and is expected.
 
-### Some conversions are unavailable
-Certain conversion paths require `ffmpeg`. If `ffmpeg` is not installed, AuraFlow will still work for normal playback and many compatibility paths, but not all optional conversions.
+### Some catalog wallpapers fail to prepare
+Some catalog sources are only available as `webm` or AV1. AuraFlow now prefers direct `mp4` sources when available, but some wallpapers still require `ffmpeg` for compatibility conversion. Install it with `brew install ffmpeg` if those sources fail to apply.
+
+### The GitHub release works on one Mac but not another
+Release artifacts must be built as a universal app. The release workflow now fails if the `x86_64` slice is missing, instead of silently publishing an Apple Silicon only bundle.
 
 ### Liquid Glass is missing
 Liquid Glass is only available on macOS 26 or later. Older macOS versions use the fallback interface.

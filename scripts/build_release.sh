@@ -17,10 +17,26 @@ ICON_PNG="$ROOT_DIR/Resources/AppIcon.png"
 ICON_ICNS="$ROOT_DIR/Resources/AppIcon.icns"
 PYTHON_BIN="${PYTHON_BUILD_PYTHON:-/usr/bin/python3}"
 BUILD_UNIVERSAL="${BUILD_UNIVERSAL:-1}"
+REQUIRE_UNIVERSAL="${REQUIRE_UNIVERSAL:-0}"
+PYTHON_RUNTIME_BUNDLING="${PYTHON_RUNTIME_BUNDLING:-1}"
+FFMPEG_RUNTIME_BUNDLING="${FFMPEG_RUNTIME_BUNDLING:-1}"
+REQUIRE_FFMPEG_RUNTIME="${REQUIRE_FFMPEG_RUNTIME:-0}"
+FFMPEG_BIN="${AURAFLOW_FFMPEG_BIN:-}"
+FFPROBE_BIN="${AURAFLOW_FFPROBE_BIN:-}"
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
+CODESIGN_KEYCHAIN_PATH="${CODESIGN_KEYCHAIN_PATH:-}"
+REQUIRE_CODESIGN="${REQUIRE_CODESIGN:-0}"
 LOCK_DIR="$ROOT_DIR/.build-lock"
 
 log() {
   printf '[build] %s\n' "$1"
+}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    log "Required command not found: $1"
+    exit 1
+  fi
 }
 
 cleanup_lock() {
@@ -91,6 +107,46 @@ prepare_environment() {
   mkdir -p "$DIST_DIR"
 }
 
+resolve_python_framework_root() {
+  "$PYTHON_BIN" - <<'PY'
+from pathlib import Path
+import sys
+
+base_prefix = Path(sys.base_prefix).expanduser().resolve()
+for candidate in (base_prefix, *base_prefix.parents):
+    if candidate.name.endswith(".framework"):
+        print(candidate)
+        raise SystemExit(0)
+
+raise SystemExit("Unable to locate Python framework root for bundling.")
+PY
+}
+
+resolve_optional_binary() {
+  local env_override="$1"
+  shift
+
+  local candidate=""
+  if [[ -n "$env_override" ]]; then
+    candidate="$env_override"
+  else
+    for candidate in "$@"; do
+      if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+    return 1
+  fi
+
+  if [[ -x "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  return 1
+}
+
 build_swift_app() {
   log "Building Swift target"
   pushd "$SWIFT_DIR" >/dev/null
@@ -107,11 +163,19 @@ build_swift_app() {
       log "Built x86_64 slice"
       built_x86="1"
     else
+      if [[ "$REQUIRE_UNIVERSAL" == "1" ]]; then
+        log "Failed to build x86_64 slice and REQUIRE_UNIVERSAL=1 is set."
+        exit 1
+      fi
       log "[warn] Failed to build x86_64 slice. Using arm64 only."
     fi
   elif [[ "$BUILD_UNIVERSAL" != "1" ]]; then
     log "Skipping x86_64 build (BUILD_UNIVERSAL=$BUILD_UNIVERSAL)"
   else
+    if [[ "$REQUIRE_UNIVERSAL" == "1" ]]; then
+      log "'arch' command not found and REQUIRE_UNIVERSAL=1 is set."
+      exit 1
+    fi
     log "[warn] 'arch' command not found; building arm64 slice only."
   fi
 
@@ -142,6 +206,15 @@ build_swift_app() {
 
   cp "$binary" "$APP_BUNDLE/Contents/MacOS/${APP_TARGET}"
   chmod +x "$APP_BUNDLE/Contents/MacOS/${APP_TARGET}"
+
+  if [[ "$REQUIRE_UNIVERSAL" == "1" ]]; then
+    local archs
+    archs="$(lipo -archs "$APP_BUNDLE/Contents/MacOS/${APP_TARGET}" 2>/dev/null || true)"
+    if [[ "$archs" != *"arm64"* || "$archs" != *"x86_64"* ]]; then
+      log "Universal build required, but produced architectures were: ${archs:-unknown}"
+      exit 1
+    fi
+  fi
 
   if [[ -d "$resources_bundle" ]]; then
     cp -R "$resources_bundle" "$APP_BUNDLE/Contents/Resources/${APP_TARGET}.bundle"
@@ -196,6 +269,152 @@ sync_python_payload() {
   fi
 }
 
+sync_python_runtime() {
+  if [[ "$PYTHON_RUNTIME_BUNDLING" != "1" ]]; then
+    log "Skipping bundled Python runtime (PYTHON_RUNTIME_BUNDLING=$PYTHON_RUNTIME_BUNDLING)"
+    return
+  fi
+
+  local framework_root
+  framework_root="$(resolve_python_framework_root)"
+  if [[ -z "$framework_root" || ! -d "$framework_root" ]]; then
+    log "Bundled Python runtime not found for $PYTHON_BIN"
+    exit 1
+  fi
+
+  local frameworks_dir="$APP_BUNDLE/Contents/Frameworks"
+  local bundled_framework="$frameworks_dir/$(basename "$framework_root")"
+  mkdir -p "$frameworks_dir"
+  rsync -a --delete \
+    --exclude '__pycache__' \
+    --exclude 'test' \
+    --exclude 'tests' \
+    "$framework_root/" "$bundled_framework/"
+}
+
+sync_ffmpeg_runtime() {
+  if [[ "$FFMPEG_RUNTIME_BUNDLING" != "1" ]]; then
+    log "Skipping bundled ffmpeg runtime (FFMPEG_RUNTIME_BUNDLING=$FFMPEG_RUNTIME_BUNDLING)"
+    return
+  fi
+
+  local ffmpeg_path=""
+  local ffprobe_path=""
+
+  ffmpeg_path="$(resolve_optional_binary "$FFMPEG_BIN" \
+    "/opt/homebrew/bin/ffmpeg" \
+    "/usr/local/bin/ffmpeg" \
+    "/usr/bin/ffmpeg" \
+  )" || true
+  if [[ -z "$ffmpeg_path" ]]; then
+    ffmpeg_path="$(command -v ffmpeg 2>/dev/null || true)"
+  fi
+  ffprobe_path="$(resolve_optional_binary "$FFPROBE_BIN" \
+    "/opt/homebrew/bin/ffprobe" \
+    "/usr/local/bin/ffprobe" \
+    "/usr/bin/ffprobe" \
+  )" || true
+  if [[ -z "$ffprobe_path" ]]; then
+    ffprobe_path="$(command -v ffprobe 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$ffmpeg_path" || -z "$ffprobe_path" ]]; then
+    local message="Bundled ffmpeg runtime not found."
+    if [[ "$REQUIRE_FFMPEG_RUNTIME" == "1" ]]; then
+      log "$message"
+      log "Set AURAFLOW_FFMPEG_BIN and AURAFLOW_FFPROBE_BIN or install ffmpeg locally."
+      exit 1
+    fi
+    log "[warn] $message Build will fall back to system ffmpeg if available on the user's Mac."
+    return
+  fi
+
+  local bin_dir="$APP_BUNDLE/Contents/Resources/bin"
+  mkdir -p "$bin_dir"
+  cp "$ffmpeg_path" "$bin_dir/ffmpeg"
+  cp "$ffprobe_path" "$bin_dir/ffprobe"
+  chmod +x "$bin_dir/ffmpeg" "$bin_dir/ffprobe"
+}
+
+codesign_args() {
+  local args=(
+    --force
+    --sign "$CODESIGN_IDENTITY"
+    --timestamp
+  )
+  if [[ -n "$CODESIGN_KEYCHAIN_PATH" ]]; then
+    args+=(--keychain "$CODESIGN_KEYCHAIN_PATH")
+  fi
+  printf '%s\n' "${args[@]}"
+}
+
+prepare_bundle_for_codesign() {
+  if [[ -z "$CODESIGN_IDENTITY" ]]; then
+    if [[ "$REQUIRE_CODESIGN" == "1" ]]; then
+      log "REQUIRE_CODESIGN=1 but CODESIGN_IDENTITY is not set."
+      exit 1
+    fi
+    return 0
+  fi
+
+  require_command codesign
+  if command -v xattr >/dev/null 2>&1; then
+    xattr -cr "$APP_BUNDLE" || true
+  fi
+  find "$APP_BUNDLE" -type d -name "_CodeSignature" -prune -exec rm -rf {} +
+}
+
+find_macho_files() {
+  while IFS= read -r -d '' candidate; do
+    if /usr/bin/file -b "$candidate" 2>/dev/null | grep -q "Mach-O"; then
+      printf '%s\n' "$candidate"
+    fi
+  done < <(find "$APP_BUNDLE" -type f -print0)
+}
+
+codesign_target() {
+  local target="$1"
+  shift || true
+  local args=()
+  while IFS= read -r arg; do
+    args+=("$arg")
+  done < <(codesign_args)
+  if [[ "$#" -gt 0 ]]; then
+    args+=("$@")
+  fi
+  codesign "${args[@]}" "$target"
+}
+
+sign_app_bundle() {
+  prepare_bundle_for_codesign
+  if [[ -z "$CODESIGN_IDENTITY" ]]; then
+    return 0
+  fi
+
+  log "Signing app bundle"
+  while IFS= read -r target; do
+    codesign_target "$target"
+  done < <(find_macho_files)
+
+  if [[ -d "$APP_BUNDLE/Contents/Frameworks" ]]; then
+    while IFS= read -r framework; do
+      codesign_target "$framework"
+    done < <(find "$APP_BUNDLE/Contents/Frameworks" -mindepth 1 -maxdepth 1 -type d \( -name "*.framework" -o -name "*.bundle" \) | sort)
+  fi
+
+  codesign_target "$APP_BUNDLE" --options runtime
+  codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+}
+
+sign_disk_image() {
+  if [[ -z "$CODESIGN_IDENTITY" ]]; then
+    return 0
+  fi
+
+  log "Signing DMG"
+  codesign_target "$APP_DMG"
+}
+
 apply_plist_customizations() {
   local plist="$APP_BUNDLE/Contents/Info.plist"
   plist_set_string "$plist" CFBundleName "$APP_DISPLAY_NAME"
@@ -228,6 +447,7 @@ package_distribution() {
     -ov -format UDZO "$APP_DMG" >/dev/null
 
   rm -rf "$dmg_stage"
+  sign_disk_image
   log "DMG готов: $APP_DMG"
 }
 
@@ -236,7 +456,10 @@ main() {
   prepare_environment
   build_swift_app
   sync_python_payload
+  sync_python_runtime
+  sync_ffmpeg_runtime
   apply_plist_customizations
+  sign_app_bundle
   package_distribution
   log "Готово: $APP_BUNDLE"
   log "Архивы: $APP_ZIP и $APP_DMG"
